@@ -24,8 +24,8 @@ Example:
   node scripts/render-homebrew-formula.mjs --version ${packageJSON.version} --sha256 <release-tarball-sha256>
 
 Install path after publishing:
-  brew tap devlin/helm
-  brew install devlin/helm/helm
+  brew tap devlln/helm
+  brew install devlln/helm/helm
 `);
 }
 

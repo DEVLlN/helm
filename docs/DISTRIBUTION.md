@@ -3,7 +3,7 @@
 Helm can support two user-facing install paths that we can realistically own:
 
 1. `npm install -g @devlin/helm`
-2. `brew tap devlin/helm && brew install devlin/helm/helm`
+2. `brew tap devlln/helm && brew install devlln/helm/helm`
 
 After either install, the user runs:
 
@@ -21,7 +21,7 @@ Those unscoped names are already taken outside this project:
 That means Helm should keep the runtime command name `helm`, but distribution should use:
 
 - the scoped npm package `@devlin/helm`
-- the `homebrew-helm` tap, exposed to users as `devlin/helm`
+- the `homebrew-helm` tap, exposed to users as `devlln/helm`
 
 ## npm release
 
@@ -71,8 +71,8 @@ node scripts/render-homebrew-formula.mjs --version 0.1.0 --sha256 <sha256>
 4. Commit that output as `Formula/helm.rb` in the `homebrew-helm` tap repo, then users can install with:
 
 ```bash
-brew tap devlin/helm
-brew install devlin/helm/helm
+brew tap devlln/helm
+brew install devlln/helm/helm
 helm setup
 ```
 
@@ -107,7 +107,7 @@ npm install -g @devlin/helm
 helm setup
 
 # Homebrew
-brew tap devlin/helm
-brew install devlin/helm/helm
+brew tap devlln/helm
+brew install devlln/helm/helm
 helm setup
 ```

@@ -232,8 +232,8 @@ helm setup
 or:
 
 ```bash
-brew tap devlin/helm
-brew install devlin/helm/helm
+brew tap devlln/helm
+brew install devlln/helm/helm
 helm setup
 ```
 
