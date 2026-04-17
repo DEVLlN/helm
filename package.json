@@ -1,0 +1,51 @@
+{
+  "name": "@devlin/helm",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Helm CLI bridge installer and runtime helpers.",
+  "homepage": "https://github.com/DEVLlN/helm-dev#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DEVLlN/helm-dev.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DEVLlN/helm-dev/issues"
+  },
+  "license": "UNLICENSED",
+  "type": "module",
+  "keywords": [
+    "codex",
+    "cli",
+    "bridge",
+    "tailscale",
+    "ios",
+    "remote-control"
+  ],
+  "bin": {
+    "helm": "bin/helm.js"
+  },
+  "files": [
+    "bin/helm.js",
+    "bridge/.env.example",
+    "bridge/package.json",
+    "bridge/package-lock.json",
+    "bridge/tsconfig.json",
+    "bridge/src",
+    "docs/DISTRIBUTION.md",
+    "scripts/*.sh",
+    "scripts/*.mjs",
+    "scripts/*.py",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "npm --prefix bridge run check",
+    "pack:dry-run": "npm pack --dry-run",
+    "formula:print": "node scripts/render-homebrew-formula.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Validate CLI help
+        run: node bin/helm.js --help
+
+      - name: Validate bridge help
+        run: node bin/helm.js bridge --help
+
+      - name: Validate platform probe JSON output
+        run: node bin/helm.js platforms --json
+
+      - name: Validate npm package payload
+        run: npm run pack:dry-run
+
+      - name: Check shell script syntax
+        run: bash -n scripts/install-helm.sh scripts/install-helm-cli.sh scripts/detect-helm-platforms.sh scripts/test-install-sandbox.sh scripts/prototype-up.sh scripts/print-pairing-qr.sh
+
+      - name: Run installer smoke test
+        run: scripts/test-install-sandbox.sh --smoke --cleanup --no-mac-app --no-runtime-start
+
+      - name: Validate generated Homebrew formula in a temporary tap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          temp_dir="$(mktemp -d)"
+          trap 'brew untap DEVLlN/homebrew-ci >/dev/null 2>&1 || true; rm -rf "$temp_dir"' EXIT
+
+          archive_path="$temp_dir/helm.tar.gz"
+          git archive --format=tar.gz --output="$archive_path" HEAD
+          sha256="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+          version="$(node -p 'require("./package.json").version')"
+
+          brew tap-new DEVLlN/homebrew-ci >/dev/null
+          tap_dir="$(brew --repository DEVLlN/homebrew-ci)"
+          node scripts/render-homebrew-formula.mjs \
+            --version "$version" \
+            --sha256 "$sha256" \
+            --url "file://$archive_path" \
+            > "$tap_dir/Formula/helm.rb"
+
+          brew install --build-from-source --formula --dry-run DEVLlN/homebrew-ci/helm

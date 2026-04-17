@@ -1,0 +1,36 @@
+name: HelmMac
+options:
+  deploymentTarget:
+    macOS: 15.0
+settings:
+  base:
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+    GCC_TREAT_WARNINGS_AS_ERRORS: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_VERSION: 6.0
+
+targets:
+  HelmMac:
+    type: application
+    platform: macOS
+    bundleId: com.devlin.helm.mac
+    sources:
+      - path: Sources
+        type: syncedFolder
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.devlin.helm.mac
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 1.0
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies: []
+
+schemes:
+  HelmMac:
+    shared: true
+    build:
+      targets:
+        HelmMac: all
+    run:
+      config: Debug
