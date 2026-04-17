@@ -31,16 +31,29 @@
     "bridge/package-lock.json",
     "bridge/tsconfig.json",
     "bridge/src",
-    "docs/DISTRIBUTION.md",
-    "scripts/*.sh",
-    "scripts/*.mjs",
-    "scripts/*.py",
+    "scripts/detect-helm-platforms.sh",
+    "scripts/disable-helm-binary-capture.sh",
+    "scripts/helm-local-model-wrapper.sh",
+    "scripts/helm-runtime-shim.sh",
+    "scripts/helm-runtime-wrapper.sh",
+    "scripts/helm_bootstrap_codex_thread.py",
+    "scripts/helm_codex_wrapper_plan.py",
+    "scripts/helm_ensure_managed_codex_thread.py",
+    "scripts/helm_runtime_relay.py",
+    "scripts/install-helm-binary-capture.sh",
+    "scripts/install-helm-cli.sh",
+    "scripts/install-helm-runtime-shims.sh",
+    "scripts/install-helm-shell-integration.sh",
+    "scripts/install-helm.sh",
+    "scripts/print-pairing-qr.sh",
+    "scripts/prototype-down.sh",
+    "scripts/prototype-status.sh",
+    "scripts/prototype-up.sh",
     "README.md"
   ],
   "scripts": {
     "check": "npm --prefix bridge run check",
-    "pack:dry-run": "npm pack --dry-run",
-    "formula:print": "node scripts/render-homebrew-formula.mjs"
+    "pack:dry-run": "npm pack --dry-run"
   },
   "publishConfig": {
     "access": "public"
