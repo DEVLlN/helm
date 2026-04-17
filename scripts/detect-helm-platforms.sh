@@ -208,23 +208,6 @@ else
   TAILSCALE_STATUS="missing"
 fi
 
-if [[ "$OS_ID" == "Darwin" && -d "$ROOT_DIR/macos/HelmMac.xcodeproj" ]]; then
-  MISSING_MAC_APP_TOOLS=()
-  for tool in xcodebuild open ditto; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      MISSING_MAC_APP_TOOLS+=("$tool")
-    fi
-  done
-
-  if [[ ${#MISSING_MAC_APP_TOOLS[@]} -eq 0 ]]; then
-    MAC_APP_BUILD_STATUS="available"
-  else
-    MAC_APP_BUILD_STATUS="unavailable (missing: ${MISSING_MAC_APP_TOOLS[*]})"
-  fi
-else
-  MAC_APP_BUILD_STATUS="unsupported on ${OS_LABEL}"
-fi
-
 if [[ "$OUTPUT_FORMAT" == "json" ]]; then
   export HELM_DETECT_OS_LABEL="$OS_LABEL"
   export HELM_DETECT_SHELL_NAME="$SHELL_NAME"
@@ -241,7 +224,6 @@ if [[ "$OUTPUT_FORMAT" == "json" ]]; then
   export HELM_DETECT_GEMMA_STATUS="$GEMMA_STATUS"
   export HELM_DETECT_QWEN_STATUS="$QWEN_STATUS"
   export HELM_DETECT_TAILSCALE_STATUS="$TAILSCALE_STATUS"
-  export HELM_DETECT_MAC_APP_BUILD_STATUS="$MAC_APP_BUILD_STATUS"
 
   python3 - <<'PY'
 import json
@@ -263,7 +245,6 @@ payload = {
     "gemmaModel": os.environ["HELM_DETECT_GEMMA_STATUS"],
     "qwenModel": os.environ["HELM_DETECT_QWEN_STATUS"],
     "tailscale": os.environ["HELM_DETECT_TAILSCALE_STATUS"],
-    "macAppBuild": os.environ["HELM_DETECT_MAC_APP_BUILD_STATUS"],
 }
 
 print(json.dumps(payload, indent=2))
@@ -287,5 +268,4 @@ ollama: ${OLLAMA_STATUS}
 gemma model: ${GEMMA_STATUS}
 qwen model: ${QWEN_STATUS}
 tailscale: ${TAILSCALE_STATUS}
-macOS app build: ${MAC_APP_BUILD_STATUS}
 EOF

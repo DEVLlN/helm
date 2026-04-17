@@ -32,13 +32,11 @@ link_script() {
 
 link_script "$ROOT_DIR/bin/helm.js" "helm"
 link_script "$ROOT_DIR/scripts/install-helm.sh" "helm-install"
-link_script "$ROOT_DIR/scripts/install-helm-mac-app.sh" "helm-install-mac-app"
 link_script "$ROOT_DIR/scripts/prototype-up.sh" "helm-prototype-up"
 link_script "$ROOT_DIR/scripts/prototype-status.sh" "helm-prototype-status"
 link_script "$ROOT_DIR/scripts/prototype-down.sh" "helm-prototype-down"
 link_script "$ROOT_DIR/scripts/print-pairing-qr.sh" "helm-pairing-qr"
 link_script "$ROOT_DIR/scripts/detect-helm-platforms.sh" "helm-platforms"
-link_script "$ROOT_DIR/scripts/install-local-prototypes.sh" "helm-install-local-prototypes"
 link_script "$ROOT_DIR/scripts/install-helm-shell-integration.sh" "helm-enable-shell-integration"
 link_script "$ROOT_DIR/scripts/install-helm-runtime-shims.sh" "helm-enable-runtime-shims"
 link_script "$ROOT_DIR/scripts/install-helm-binary-capture.sh" "helm-enable-binary-capture"
@@ -65,13 +63,11 @@ Installed helper commands in:
 Available helpers:
   helm
   helm-install
-  helm-install-mac-app
   helm-prototype-up
   helm-prototype-status
   helm-prototype-down
   helm-pairing-qr
   helm-platforms
-  helm-install-local-prototypes
   helm-enable-shell-integration
   helm-enable-runtime-shims
   helm-enable-binary-capture
@@ -97,7 +93,7 @@ Recommended next steps:
      helm-prototype-up
   5. Print a pairing QR in the terminal if you need it again:
      helm-pairing-qr
-  6. In helm on iPhone, scan the pairing QR.
+  6. In a Helm client, scan the pairing QR.
   7. Start Codex CLI, Claude Code, or Grok CLI sessions normally.
   8. If Ollama is installed, start local model sessions with:
      helm-gemma

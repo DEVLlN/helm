@@ -341,17 +341,15 @@ if suggested:
 
 setup_url = pairing.get("setupURL")
 if setup_url:
-    print(f"Setup link: {setup_url}")
+print(f"Setup link: {setup_url}")
 
 print(f"Logs: {log_dir}")
 print()
 print("Next steps:")
-print("  1. Open ios/Helm.xcodeproj for iPhone testing.")
-print("  2. Open macos/HelmMac.xcodeproj for menu bar testing.")
-print("  3. Open watchos/HelmWatch.xcodeproj for watch testing.")
-print("  4. In helm Settings, use the local pairing file or paste the setup link.")
-print("  5. Use scripts/prototype-status.sh to reprint pairing and health info.")
-print("  6. Use scripts/prototype-down.sh when you want to stop the local stack.")
+print("  1. Use helm bridge pair to reprint the QR or setup link.")
+print("  2. Use scripts/prototype-status.sh to reprint pairing and health info.")
+print("  3. Start Codex, Claude, Grok, or local Ollama sessions through Helm.")
+print("  4. Use scripts/prototype-down.sh when you want to stop the local stack.")
 PY
 
 if [[ "$TAILSCALE_ACTIVE" -eq 1 ]]; then

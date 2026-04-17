@@ -2,37 +2,31 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALL_MAC_APP=1
-OPEN_MAC_APP=1
 SHELL_NAME=""
 TAILSCALE_SETUP=1
 PRINT_PAIRING_QR=1
 ASSUME_YES="${HELM_INSTALL_ASSUME_YES:-0}"
 NO_INPUT="${HELM_INSTALL_NO_INPUT:-0}"
-MAC_APP_STATUS="not requested"
 BRIDGE_STATUS="not started"
 TAILSCALE_STATUS="not checked"
 PAIRING_QR_STATUS="not printed"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/install-helm.sh [--no-mac-app] [--no-open-mac-app] [--skip-tailscale] [--no-pairing-qr] [--yes] [--no-input] [--shell zsh|bash]
+Usage: scripts/install-helm.sh [--skip-tailscale] [--no-pairing-qr] [--yes] [--no-input] [--shell zsh|bash]
 
-Default install path for Helm on a local Mac checkout.
+Default install path for the public Helm bridge checkout.
 
 By default this installs:
   1. Helm CLI, bridge helpers, runtime shims, shell integration, and binary capture
-  2. the macOS Helm app for local Command support
-  3. an interactive Tailscale sign-in prompt for easy iPhone pairing
-  4. a terminal pairing QR for the iPhone app
+  2. an interactive Tailscale sign-in prompt for easy remote pairing
+  3. a terminal pairing QR after bridge startup
 
 Optional runtimes auto-hooked after install:
   - Grok via grok or grok-cli from https://grokcli.io/
   - Gemma/Qwen local models via Ollama (helm-gemma / helm-qwen)
 
 Options:
-  --no-mac-app       Skip building and installing the macOS helm app.
-  --no-open-mac-app  Install the macOS helm app without opening it.
   --skip-tailscale   Skip the Tailscale sign-in prompt.
   --no-pairing-qr    Do not print the terminal pairing QR after bridge startup.
   --yes              Accept Helm's setup prompts automatically when a prompt is offered.
@@ -110,7 +104,7 @@ configure_tailscale_for_pairing() {
 
   if ! command -v tailscale >/dev/null 2>&1; then
     TAILSCALE_STATUS="not installed"
-    echo "[helm] Tailscale is the easiest way to pair your iPhone when you are away from this Mac."
+    echo "[helm] Tailscale is the easiest way to pair a remote Helm client when you are away from this Mac."
     if prompt_yes_no "[helm] Tailscale is not installed. Open the download page now?" "yes"; then
       if command -v open >/dev/null 2>&1; then
         open "https://tailscale.com/download"
@@ -134,7 +128,7 @@ configure_tailscale_for_pairing() {
   TAILSCALE_STATUS="installed but not connected"
   echo "[helm] Tailscale is installed but this Mac is not signed in to a tailnet."
 
-  if ! prompt_yes_no "[helm] Sign in to Tailscale now so your iPhone can pair over your tailnet?" "yes"; then
+  if ! prompt_yes_no "[helm] Sign in to Tailscale now so a remote Helm client can pair over your tailnet?" "yes"; then
     echo "[helm] Skipping Tailscale sign-in. You can run 'tailscale up' later, then rerun 'helm-pairing-qr'."
     return
   fi
@@ -159,12 +153,8 @@ configure_tailscale_for_pairing() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-mac-app)
-      INSTALL_MAC_APP=0
-      shift
-      ;;
-    --no-open-mac-app)
-      OPEN_MAC_APP=0
+    --no-mac-app|--no-open-mac-app)
+      # Compatibility no-op: the public repo is bridge-only.
       shift
       ;;
     --skip-tailscale)
@@ -209,26 +199,6 @@ if [[ -n "$SHELL_NAME" ]]; then
 fi
 "${SHELL_CMD[@]}"
 
-if [[ "$INSTALL_MAC_APP" -eq 1 ]]; then
-  if command -v xcodebuild >/dev/null 2>&1 && command -v open >/dev/null 2>&1 && command -v ditto >/dev/null 2>&1; then
-    MAC_CMD=("$ROOT_DIR/scripts/install-helm-mac-app.sh")
-    if [[ "$OPEN_MAC_APP" -eq 0 ]]; then
-      MAC_CMD+=(--no-open)
-    fi
-    if "${MAC_CMD[@]}"; then
-      MAC_APP_STATUS="installed"
-    else
-      MAC_APP_STATUS="install failed"
-      echo "[helm] macOS app install failed. helm CLI setup still completed." >&2
-    fi
-  else
-    MAC_APP_STATUS="skipped (Xcode build tools unavailable)"
-    echo "[helm] Skipping macOS app install because Xcode build tools are unavailable. Re-run with --no-mac-app to opt out explicitly." >&2
-  fi
-else
-  MAC_APP_STATUS="opted out (--no-mac-app)"
-fi
-
 configure_tailscale_for_pairing
 
 DETECTION_SUMMARY="$("$ROOT_DIR/scripts/detect-helm-platforms.sh" || true)"
@@ -260,7 +230,7 @@ else
   fi
 fi
 
-PAIRING_NEXT_STEP="In iPhone Helm, scan the QR printed above. To print it again, run: helm-pairing-qr"
+PAIRING_NEXT_STEP="In a Helm client, scan the QR printed above. To print it again, run: helm-pairing-qr"
 if [[ "$PAIRING_QR_STATUS" == "skipped" ]]; then
   PAIRING_NEXT_STEP="Print a pairing QR when you are ready: helm-pairing-qr"
 elif [[ "$PAIRING_QR_STATUS" == "not printed (bridge is not running)" ]]; then
@@ -275,7 +245,6 @@ Helm install is complete.
 
 Installed by default:
   - Helm CLI, bridge helpers, runtime shims, binary capture, and shell integration
-  - macOS Helm Command app: $MAC_APP_STATUS
 
 Bridge:
   - $BRIDGE_STATUS

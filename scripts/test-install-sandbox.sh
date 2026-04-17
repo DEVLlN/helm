@@ -9,7 +9,6 @@ LATEST_ENV_LINK="$SANDBOX_LINK_ROOT/latest-env.sh"
 LATEST_RUN_LINK="$SANDBOX_LINK_ROOT/latest-run.sh"
 SANDBOX_ROOT=""
 KEEP_SANDBOX=1
-INSTALL_MAC_APP=1
 SHELL_NAME="zsh"
 START_RUNTIME=1
 RUN_SMOKE=0
@@ -23,20 +22,19 @@ SMOKE_PASSES=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/test-install-sandbox.sh [--root PATH] [--cleanup] [--no-mac-app] [--no-runtime-start] [--shell zsh|bash] [--smoke]
+Usage: scripts/test-install-sandbox.sh [--root PATH] [--cleanup] [--no-runtime-start] [--shell zsh|bash] [--smoke]
 
 Create a disposable temp-HOME sandbox and run the helm installer inside it.
 
 Default behavior:
   - creates an isolated HOME under a temp directory
   - skips launchd PATH mutation and absolute binary capture
-  - redirects the macOS app install out of /Applications
   - starts the bridge and Codex app-server on isolated localhost ports
   - keeps the sandbox on disk so you can inspect it afterward
   - refreshes stable repo-local links under .runtime/test-install-sandbox/
 
 Smoke mode:
-  - verifies the CLI helpers, runtime shims, shell integration, and optional Mac app were installed in the sandbox
+  - verifies the CLI helpers, runtime shims, and shell integration were installed in the sandbox
   - verifies interactive shell resolution points at the sandbox shims
   - verifies isolated bridge health and pairing artifacts when runtime start is enabled
   - exits non-zero if any assertion fails
@@ -168,10 +166,6 @@ run_smoke_checks() {
   assert_exists "$SANDBOX_HOME/.config/helm/shell/integration.$SHELL_NAME" "shell integration snippet was written"
   assert_not_exists "$SANDBOX_HOME/.config/helm/runtime-binary-capture.json" "absolute binary capture stayed disabled in sandbox"
 
-  if [[ "$INSTALL_MAC_APP" -eq 1 ]]; then
-    assert_exists "$SANDBOX_APPS/Helm.app" "Mac app was installed into the sandbox destination"
-  fi
-
   assert_command "helm help succeeds in the sandbox" "$SANDBOX_HOME/.local/bin/helm" help
   assert_command "helm platforms --json succeeds in the sandbox" "$SANDBOX_HOME/.local/bin/helm" platforms --json
 
@@ -231,7 +225,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --no-mac-app)
-      INSTALL_MAC_APP=0
+      # Compatibility no-op: the public repo is bridge-only.
       shift
       ;;
     --no-runtime-start)
@@ -265,13 +259,11 @@ else
 fi
 
 SANDBOX_HOME="$SANDBOX_ROOT/home"
-SANDBOX_APPS="$SANDBOX_ROOT/Applications"
 SANDBOX_RUNTIME="$SANDBOX_ROOT/runtime/prototype"
-SANDBOX_BUILD="$SANDBOX_ROOT/build/macos-installer"
 SMOKE_REAL_CODEX_PATH="$SANDBOX_ROOT/fake-real-codex"
 PAIRING_FILE="$SANDBOX_HOME/Library/Application Support/Helm/bridge-pairing.json"
 
-mkdir -p "$SANDBOX_HOME" "$SANDBOX_APPS" "$SANDBOX_RUNTIME" "$SANDBOX_BUILD"
+mkdir -p "$SANDBOX_HOME" "$SANDBOX_RUNTIME"
 
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
   cat >"$SMOKE_REAL_CODEX_PATH" <<'EOF'
@@ -352,8 +344,6 @@ export HOME="$SANDBOX_HOME"
 export PATH="$SANDBOX_HOME/.local/share/helm/runtime-shims:$SANDBOX_HOME/.local/bin:$CLEAN_PATH"
 export HELM_SKIP_LAUNCHD_PATH=1
 export HELM_SKIP_BINARY_CAPTURE=1
-export HELM_MAC_APP_DEST="$SANDBOX_APPS/Helm.app"
-export HELM_MAC_BUILD_DIR="$SANDBOX_BUILD"
 export HELM_PROTOTYPE_RUNTIME_DIR="$SANDBOX_RUNTIME"
 export BRIDGE_PORT="$BRIDGE_PORT"
 export CODEX_APP_SERVER_URL="ws://127.0.0.1:$APP_SERVER_PORT"
@@ -376,18 +366,13 @@ ln -s "$SANDBOX_ROOT" "$LATEST_ROOT_LINK"
 ln -s "$ENV_FILE" "$LATEST_ENV_LINK"
 ln -s "$RUN_FILE" "$LATEST_RUN_LINK"
 
-INSTALL_ARGS=(--shell "$SHELL_NAME" --no-open-mac-app)
-if [[ "$INSTALL_MAC_APP" -eq 0 ]]; then
-  INSTALL_ARGS+=(--no-mac-app)
-fi
+INSTALL_ARGS=(--shell "$SHELL_NAME")
 
 (
   export HOME="$SANDBOX_HOME"
   export PATH="$CLEAN_PATH"
   export HELM_SKIP_LAUNCHD_PATH=1
   export HELM_SKIP_BINARY_CAPTURE=1
-  export HELM_MAC_APP_DEST="$SANDBOX_APPS/Helm.app"
-  export HELM_MAC_BUILD_DIR="$SANDBOX_BUILD"
   export HELM_PROTOTYPE_RUNTIME_DIR="$SANDBOX_RUNTIME"
   export BRIDGE_PORT="$BRIDGE_PORT"
   export CODEX_APP_SERVER_URL="ws://127.0.0.1:$APP_SERVER_PORT"
@@ -437,9 +422,6 @@ Sandbox root:
 
 Sandbox home:
   $SANDBOX_HOME
-
-Sandbox app destination:
-  $SANDBOX_APPS/Helm.app
 
 Sandbox bridge:
   http://127.0.0.1:$BRIDGE_PORT

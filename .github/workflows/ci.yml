@@ -19,6 +19,9 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Enforce public repo scope
+        run: scripts/check-public-repo.sh
+
       - name: Validate CLI help
         run: node bin/helm.js --help
 
@@ -32,10 +35,10 @@ jobs:
         run: npm run pack:dry-run
 
       - name: Check shell script syntax
-        run: bash -n scripts/install-helm.sh scripts/install-helm-cli.sh scripts/detect-helm-platforms.sh scripts/test-install-sandbox.sh scripts/prototype-up.sh scripts/print-pairing-qr.sh
+        run: bash -n scripts/check-public-repo.sh scripts/install-helm.sh scripts/install-helm-cli.sh scripts/detect-helm-platforms.sh scripts/test-install-sandbox.sh scripts/prototype-up.sh scripts/print-pairing-qr.sh
 
       - name: Run installer smoke test
-        run: scripts/test-install-sandbox.sh --smoke --cleanup --no-mac-app --no-runtime-start
+        run: scripts/test-install-sandbox.sh --smoke --cleanup --no-runtime-start
 
       - name: Validate generated Homebrew formula in a temporary tap
         shell: bash

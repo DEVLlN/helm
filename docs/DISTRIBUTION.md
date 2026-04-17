@@ -52,20 +52,20 @@ This repo does not replace Homebrew core. Instead, publish a formula in a dedica
 1. Create a Git tag and GitHub release tarball:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 2. Compute the public release tarball checksum:
 
 ```bash
-curl -L "https://codeload.github.com/DEVLlN/helm/tar.gz/refs/tags/v0.1.0" | shasum -a 256
+curl -L "https://codeload.github.com/DEVLlN/helm/tar.gz/refs/tags/vX.Y.Z" | shasum -a 256
 ```
 
 3. Render the formula:
 
 ```bash
-node scripts/render-homebrew-formula.mjs --version 0.1.0 --sha256 <sha256>
+node scripts/render-homebrew-formula.mjs --version X.Y.Z --sha256 <sha256>
 ```
 
 4. Commit that output as `Formula/helm.rb` in the `homebrew-helm` tap repo, then users can install with:
@@ -91,7 +91,7 @@ Required repo secrets in `DEVLlN/helm`:
 The steady-state release flow is:
 
 ```bash
-git tag v0.1.0
+git tag vX.Y.Z
 git push origin main --follow-tags
 ```
 
