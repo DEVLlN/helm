@@ -481,7 +481,7 @@ export class CodexAppServerClient extends EventEmitter {
         clientInfo: {
           name: "CodexVoiceRemoteBridge",
           title: null,
-          version: "0.1.1",
+          version: "0.1.3",
         },
         capabilities: {
           experimentalApi: true,

@@ -312,10 +312,11 @@ start_app_server
 start_bridge
 wait_for_bridge
 
-PAIRING_JSON="$(curl -sf "$LOCAL_BRIDGE_URL/api/pairing")"
-HEALTH_JSON="$(curl -sf "$LOCAL_BRIDGE_URL/health")"
+if [[ "${HELM_PROTOTYPE_COMPACT:-0}" != "1" ]]; then
+  PAIRING_JSON="$(curl -sf "$LOCAL_BRIDGE_URL/api/pairing")"
+  HEALTH_JSON="$(curl -sf "$LOCAL_BRIDGE_URL/health")"
 
-python3 - "$PAIRING_JSON" "$HEALTH_JSON" "$CODEX_APP_SERVER_URL" "$LOCAL_BRIDGE_URL" "$LOG_DIR" <<'PY'
+  python3 - "$PAIRING_JSON" "$HEALTH_JSON" "$CODEX_APP_SERVER_URL" "$LOCAL_BRIDGE_URL" "$LOG_DIR" <<'PY'
 import json
 import sys
 
@@ -341,28 +342,23 @@ if suggested:
 
 setup_url = pairing.get("setupURL")
 if setup_url:
-print(f"Setup link: {setup_url}")
+    print(f"Setup link: {setup_url}")
 
 print(f"Logs: {log_dir}")
-print()
-print("Next steps:")
-print("  1. Use helm bridge pair to reprint the QR or setup link.")
-print("  2. Use scripts/prototype-status.sh to reprint pairing and health info.")
-print("  3. Start Codex, Claude, Grok, or local Ollama sessions through Helm.")
-print("  4. Use scripts/prototype-down.sh when you want to stop the local stack.")
 PY
 
-if [[ "$TAILSCALE_ACTIVE" -eq 1 ]]; then
-  echo
-  echo "[prototype] Tailscale detected. helm is preferring the Tailscale bridge URL by default:"
-  echo "[prototype]   http://${TAILSCALE_IP}:${BRIDGE_PORT}"
+  if [[ "$TAILSCALE_ACTIVE" -eq 1 ]]; then
+    echo
+    echo "[prototype] Tailscale detected. helm is preferring the Tailscale bridge URL by default:"
+    echo "[prototype]   http://${TAILSCALE_IP}:${BRIDGE_PORT}"
+  fi
 fi
 
 if [[ "${HELM_PROTOTYPE_SKIP_PAIRING_QR:-0}" != "1" && -t 1 ]] && [[ "$LAN_MODE" -eq 1 || "$TAILSCALE_ACTIVE" -eq 1 ]]; then
   "$ROOT_DIR/scripts/print-pairing-qr.sh"
 fi
 
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+if [[ -z "${OPENAI_API_KEY:-}" && "${HELM_PROTOTYPE_COMPACT:-0}" != "1" ]]; then
   echo
   echo "[prototype] OPENAI_API_KEY is not set. Text control will work, but OpenAI Realtime Command and bridge speech will not."
 fi

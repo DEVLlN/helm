@@ -129,7 +129,7 @@ What changed:
   - GUI apps that use absolute codex, claude, or grok symlinks can also be captured with helm-enable-binary-capture
 
 Next steps:
-  1. Relaunch GUI apps like Codex, Claude, and VS Code so they inherit the new PATH.
+  1. Relaunch GUI apps like Codex and Claude so they inherit the new PATH.
   2. Run helm-enable-binary-capture if desktop apps still bypass PATH and launch codex or claude by absolute symlink path.
   3. Enable shell integration if you also want new terminal windows to pick up the same shim path automatically.
 EOF

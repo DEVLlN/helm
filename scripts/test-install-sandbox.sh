@@ -75,7 +75,16 @@ cleanup_sandbox() {
   fi
 
   clear_latest_links_if_matching
-  rm -rf "$SANDBOX_ROOT"
+
+  local attempt
+  for attempt in 1 2 3; do
+    if rm -rf "$SANDBOX_ROOT" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+
+  rm -rf "$SANDBOX_ROOT" >/dev/null 2>&1 || true
 }
 
 trap cleanup_sandbox EXIT

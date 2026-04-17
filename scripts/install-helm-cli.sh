@@ -88,11 +88,11 @@ Recommended next steps:
      helm setup
   2. Or, if you prefer the lower-level steps, enable shell integration explicitly:
      helm-enable-shell-integration
-  3. Relaunch GUI apps like Codex, Claude, Grok, and VS Code so they inherit helm's runtime shim PATH.
+  3. Relaunch GUI apps like Codex, Claude, and Grok so they inherit helm's runtime shim PATH.
   4. Start the bridge for cross-device use:
      helm-prototype-up
   5. Print a pairing QR in the terminal if you need it again:
-     helm-pairing-qr
+     helm pair
   6. In a Helm client, scan the pairing QR.
   7. Start Codex CLI, Claude Code, or Grok CLI sessions normally.
   8. If Ollama is installed, start local model sessions with:

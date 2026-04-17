@@ -45,14 +45,14 @@ function bridgeUsage() {
 Usage:
   helm bridge setup [setup options]
   helm bridge up [--lan]
-  helm bridge pair [--no-start]
+  helm bridge pair [--no-start] [--show-link]
   helm bridge status
   helm bridge down
 
 Bridge commands:
   setup   Run the guided Helm bridge setup flow.
   up      Start the local bridge and Codex app-server helper.
-  pair    Start the bridge if needed, then print the pairing QR and setup link.
+  pair    Start the bridge if needed, then print the pairing QR.
   status  Show bridge health, pairing details, and voice-provider availability.
   down    Stop the local prototype bridge stack.
 `);
