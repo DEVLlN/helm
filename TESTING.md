@@ -9,7 +9,7 @@ Use it to validate the local bridge, the Apple clients, and the current `Command
 Start the local stack:
 
 ```bash
-cd /Users/devlin/GitHub/helm-dev
+cd /Users/devlin/GitHub/helm
 scripts/prototype-up.sh
 scripts/prototype-status.sh
 ```
@@ -76,9 +76,9 @@ Expected result:
 Useful follow-up commands:
 
 ```bash
-source /Users/devlin/GitHub/helm-dev/.runtime/test-install-sandbox/latest-env.sh
-/Users/devlin/GitHub/helm-dev/.runtime/test-install-sandbox/latest-run.sh scripts/prototype-status.sh
-/Users/devlin/GitHub/helm-dev/.runtime/test-install-sandbox/latest-run.sh zsh -ic 'command -v codex && command -v claude && ls -la ~/.local/bin'
+source /Users/devlin/GitHub/helm/.runtime/test-install-sandbox/latest-env.sh
+/Users/devlin/GitHub/helm/.runtime/test-install-sandbox/latest-run.sh scripts/prototype-status.sh
+/Users/devlin/GitHub/helm/.runtime/test-install-sandbox/latest-run.sh zsh -ic 'command -v codex && command -v claude && ls -la ~/.local/bin'
 ```
 
 ## Local CLI Setup and Autoinjection
@@ -126,7 +126,7 @@ Expected result:
 
 Open:
 
-- `/Users/devlin/GitHub/helm-dev/ios/Helm.xcodeproj`
+- `/Users/devlin/GitHub/helm/ios/Helm.xcodeproj`
 
 Build target:
 
@@ -240,7 +240,7 @@ Current limit:
 
 Open:
 
-- `/Users/devlin/GitHub/helm-dev/macos/HelmMac.xcodeproj`
+- `/Users/devlin/GitHub/helm/macos/HelmMac.xcodeproj`
 
 Build target:
 
@@ -268,7 +268,7 @@ Expected result:
 
 Open:
 
-- `/Users/devlin/GitHub/helm-dev/watchos/HelmWatch.xcodeproj`
+- `/Users/devlin/GitHub/helm/watchos/HelmWatch.xcodeproj`
 
 Build target:
 

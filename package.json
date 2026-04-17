@@ -3,13 +3,13 @@
   "version": "0.1.0",
   "private": false,
   "description": "Helm CLI bridge installer and runtime helpers.",
-  "homepage": "https://github.com/DEVLlN/helm-dev#readme",
+  "homepage": "https://github.com/DEVLlN/helm#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DEVLlN/helm-dev.git"
+    "url": "git+https://github.com/DEVLlN/helm.git"
   },
   "bugs": {
-    "url": "https://github.com/DEVLlN/helm-dev/issues"
+    "url": "https://github.com/DEVLlN/helm/issues"
   },
   "license": "UNLICENSED",
   "type": "module",

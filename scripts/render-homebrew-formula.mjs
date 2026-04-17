@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 
 const rootDir = fileURLToPath(new URL("..", import.meta.url));
 const packageJSON = JSON.parse(readFileSync(join(rootDir, "package.json"), "utf8"));
+const repositoryURL = packageJSON.repository?.url ?? "";
+const repoMatch = repositoryURL.match(/github\.com[:/](.+?)\/(.+?)(?:\.git)?$/i);
+const repoOwner = repoMatch?.[1] ?? "DEVLlN";
+const repoName = repoMatch?.[2] ?? "helm";
 
 function usage() {
   console.log(`Usage: node scripts/render-homebrew-formula.mjs [--version X.Y.Z] [--sha256 SHA256] [--url SOURCE_URL]
@@ -14,10 +18,10 @@ Render the Homebrew formula for the homebrew-helm tap.
 
 Defaults:
   version  ${packageJSON.version}
-  package  ${packageJSON.name}
+  repo     ${repoOwner}/${repoName}
 
 Example:
-  node scripts/render-homebrew-formula.mjs --version ${packageJSON.version} --sha256 <npm-tarball-sha256>
+  node scripts/render-homebrew-formula.mjs --version ${packageJSON.version} --sha256 <release-tarball-sha256>
 
 Install path after publishing:
   brew tap devlin/helm
@@ -59,12 +63,11 @@ if (!version || !sha256) {
   process.exit(2);
 }
 
-function npmTarballURL(packageName, packageVersion) {
-  const tarballBaseName = packageName.split("/").pop();
-  return `https://registry.npmjs.org/${packageName}/-/${tarballBaseName}-${packageVersion}.tgz`;
+function githubTagTarballURL(owner, repo, packageVersion) {
+  return `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/v${packageVersion}`;
 }
 
-const tarballURL = sourceURL || npmTarballURL(packageJSON.name, version);
+const tarballURL = sourceURL || githubTagTarballURL(repoOwner, repoName, version);
 
 function renderHomebrewLicense(rawLicense) {
   if (typeof rawLicense !== "string" || rawLicense.trim() === "" || rawLicense === "UNLICENSED") {
@@ -76,7 +79,7 @@ function renderHomebrewLicense(rawLicense) {
 
 const formula = `class Helm < Formula
   desc "Helm bridge installer and runtime helpers"
-  homepage "https://www.npmjs.com/package/${packageJSON.name}"
+  homepage "https://github.com/${repoOwner}/${repoName}"
   url "${tarballURL}"
   sha256 "${sha256}"
   version "${version}"

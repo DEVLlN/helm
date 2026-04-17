@@ -2,7 +2,7 @@
 
 Helm is the product name.
 
-`helm-dev` is the repository name.
+`helm` is the public repository name.
 
 Helm is an iPhone-first remote control app for Codex with a Command layer aimed at a one-system workflow:
 
@@ -200,7 +200,7 @@ This repo borrows the right ideas from Remodex:
 ## Repository layout
 
 ```text
-helm-dev/
+helm/
 ├── bridge/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -245,7 +245,7 @@ The unscoped names are not available for this project:
 For the current unpublished developer path, install from GitHub directly:
 
 ```bash
-npm install -g github:DEVLlN/helm-dev
+npm install -g github:DEVLlN/helm
 helm setup
 ```
 
@@ -327,8 +327,8 @@ That sandbox harness redirects `HOME`, skips launchd PATH mutation and absolute 
 After a non-cleanup run, the latest sandbox is also available through stable repo-local links:
 
 ```bash
-source /Users/devlin/GitHub/helm-dev/.runtime/test-install-sandbox/latest-env.sh
-/Users/devlin/GitHub/helm-dev/.runtime/test-install-sandbox/latest-run.sh scripts/prototype-status.sh
+source /Users/devlin/GitHub/helm/.runtime/test-install-sandbox/latest-env.sh
+/Users/devlin/GitHub/helm/.runtime/test-install-sandbox/latest-run.sh scripts/prototype-status.sh
 ```
 
 ## Bridge setup
@@ -458,7 +458,7 @@ There is also now an experimental provider-native spoken-response branch on iPho
 
 ## iOS setup
 
-The iOS target is defined with XcodeGen in [`ios/project.yml`](/Users/devlin/GitHub/helm-dev/ios/project.yml).
+The iOS target is defined with XcodeGen in [`ios/project.yml`](/Users/devlin/GitHub/helm/ios/project.yml).
 
 Generate the project locally with:
 
@@ -471,7 +471,7 @@ open Helm.xcodeproj
 
 ## macOS setup
 
-The macOS menu bar target is defined with XcodeGen in [`macos/project.yml`](/Users/devlin/GitHub/helm-dev/macos/project.yml).
+The macOS menu bar target is defined with XcodeGen in [`macos/project.yml`](/Users/devlin/GitHub/helm/macos/project.yml).
 
 Generate the project locally with:
 
@@ -503,7 +503,7 @@ Current default shortcuts:
 
 ## watchOS setup
 
-The watchOS target is defined with XcodeGen in [`watchos/project.yml`](/Users/devlin/GitHub/helm-dev/watchos/project.yml).
+The watchOS target is defined with XcodeGen in [`watchos/project.yml`](/Users/devlin/GitHub/helm/watchos/project.yml).
 
 Generate the project locally with:
 

@@ -56,10 +56,10 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-2. Compute the release tarball checksum:
+2. Compute the public release tarball checksum:
 
 ```bash
-curl -L "https://github.com/DEVLlN/helm-dev/archive/refs/tags/v0.1.0.tar.gz" | shasum -a 256
+curl -L "https://codeload.github.com/DEVLlN/helm/tar.gz/refs/tags/v0.1.0" | shasum -a 256
 ```
 
 3. Render the formula:
@@ -83,7 +83,7 @@ This repo now supports a tag-driven release flow in GitHub Actions:
 - `.github/workflows/ci.yml` validates the CLI surface, npm package payload, sandbox installer, and generated Homebrew formula on every push and pull request.
 - `.github/workflows/release.yml` runs on `v*` tags, publishes `@devlin/helm` to npm, creates a GitHub release if needed, and updates `DEVLlN/homebrew-helm` with the new `Formula/helm.rb`.
 
-Required repo secrets in `DEVLlN/helm-dev`:
+Required repo secrets in `DEVLlN/helm`:
 
 - `NPM_TOKEN`: npm automation token with publish rights for `@devlin/helm`
 - `HOMEBREW_TAP_TOKEN`: GitHub token with write access to `DEVLlN/homebrew-helm`
