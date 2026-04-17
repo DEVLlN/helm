@@ -4,6 +4,13 @@ Helm sets up the bridge and CLI helpers that keep local Codex sessions reachable
 
 ## Install
 
+### npm
+
+```bash
+npm install -g @devlln/helm
+helm setup
+```
+
 ### Homebrew
 
 ```bash
@@ -18,8 +25,6 @@ helm setup
 npm install -g github:DEVLlN/helm
 helm setup
 ```
-
-The public npm registry package `@devlin/helm` is still being wired up. Until that is live, use Homebrew or the GitHub install above.
 
 ## Setup
 
@@ -101,12 +106,12 @@ If Tailscale is connected, Helm prefers the Tailscale bridge URL automatically w
 - [x] Tailscale-aware pairing and terminal QR output
 - [x] Bridge lifecycle commands for `up`, `pair`, `status`, and `down`
 - [x] Shell integration and binary capture for GUI-launched tools
+- [x] Public npm install via `npm install -g @devlln/helm`
 - [x] Homebrew install via `devlln/helm`
 - [x] GitHub install via `npm install -g github:DEVLlN/helm`
 
 ### In progress
 
-- [ ] Public npm registry publish for `@devlin/helm`
 - [ ] More first-run validation and repair guidance
 - [ ] Broader runtime detection hardening across different local setups
 

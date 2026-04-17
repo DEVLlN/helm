@@ -2,7 +2,7 @@
 
 Helm can support two user-facing install paths that we can realistically own:
 
-1. `npm install -g @devlin/helm`
+1. `npm install -g @devlln/helm`
 2. `brew tap devlln/helm && brew install devlln/helm/helm`
 
 After either install, the user runs:
@@ -20,7 +20,7 @@ Those unscoped names are already taken outside this project:
 
 That means Helm should keep the runtime command name `helm`, but distribution should use:
 
-- the scoped npm package `@devlin/helm`
+- the scoped npm package `@devlln/helm`
 - the `homebrew-helm` tap, exposed to users as `devlln/helm`
 
 ## npm release
@@ -40,7 +40,7 @@ npm publish --access public
 3. Validate the install flow in a clean shell:
 
 ```bash
-npm install -g @devlin/helm
+npm install -g @devlln/helm
 helm --help
 helm setup
 ```
@@ -81,11 +81,11 @@ helm setup
 This repo now supports a tag-driven release flow in GitHub Actions:
 
 - `.github/workflows/ci.yml` validates the CLI surface, npm package payload, sandbox installer, and generated Homebrew formula on every push and pull request.
-- `.github/workflows/release.yml` runs on `v*` tags, publishes `@devlin/helm` to npm, creates a GitHub release if needed, and updates `DEVLlN/homebrew-helm` with the new `Formula/helm.rb`.
+- `.github/workflows/release.yml` runs on `v*` tags, publishes `@devlln/helm` to npm, creates a GitHub release if needed, and updates `DEVLlN/homebrew-helm` with the new `Formula/helm.rb`.
 
 Required repo secrets in `DEVLlN/helm`:
 
-- `NPM_TOKEN`: npm automation token with publish rights for `@devlin/helm`
+- `NPM_TOKEN`: npm publish token with publish rights for `@devlln/helm`
 - `HOMEBREW_TAP_TOKEN`: GitHub token with write access to `DEVLlN/homebrew-helm`
 
 The steady-state release flow is:
@@ -103,7 +103,7 @@ Use this wording in docs and release notes:
 
 ```bash
 # npm
-npm install -g @devlin/helm
+npm install -g @devlln/helm
 helm setup
 
 # Homebrew
