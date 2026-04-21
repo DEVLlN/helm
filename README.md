@@ -81,6 +81,7 @@ Lower-level helpers:
 helm-prototype-up
 helm-prototype-status
 helm-prototype-down
+helm-bridge-service install
 helm-pairing-qr
 ```
 

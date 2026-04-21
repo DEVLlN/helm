@@ -19,23 +19,32 @@ import {
   listCodexThreadReplacements,
   recordCodexThreadReplacement,
 } from "./codexThreadReplacementRegistry.js";
-import { resolveCodexThreadByName } from "./codexThreadDiscovery.js";
+import {
+  codexThreadPreviewForDisplay,
+  discoverCodexThread,
+  preferredCodexThreadName,
+  resolveCodexThreadByName,
+} from "./codexThreadDiscovery.js";
 import { HELM_RUNTIME_LAUNCH_SOURCE, isHelmManagedLaunchSource } from "./helmManagedLaunch.js";
 import { ManagedTerminalBackend } from "./managedTerminalBackend.js";
 import { OpenAIVoiceProvider } from "./openAIVoiceProvider.js";
 import { PairingManager } from "./pairingManager.js";
 import { PersonaPlexVoiceProvider } from "./personaPlexVoiceProvider.js";
+import { RealtimeEventLog } from "./realtimeEventLog.js";
 import { RuntimeTracker } from "./runtimeTracker.js";
 import {
   canonicalRuntimeThreadId,
+  findMatchingLaunchByPID,
   findMatchingLaunchByThreadID,
   isRuntimeRelayAvailable,
   listRuntimeLaunches,
   readRuntimeOutputTail,
   updateRuntimeLaunchThreadId,
+  type RuntimeLaunchRecord,
   type RuntimeOutputTail,
 } from "./runtimeLaunchRegistry.js";
 import { sessionLaunchOptionsForBackend } from "./sessionLaunchConfig.js";
+import { captureSimulatorScreenshot, listBootedSimulators } from "./simulatorMirror.js";
 import { extractReadableText } from "./threadTextExtraction.js";
 import { ThreadControllerRegistry } from "./threadControllerRegistry.js";
 import { UnavailableBackend } from "./unavailableBackend.js";
@@ -111,11 +120,23 @@ export class BridgeServer {
   private static readonly THREAD_DETAIL_BURST_DELAYS_MS = [0, 120, 320, 900];
   private static readonly THREAD_DETAIL_ACTIVE_POLL_REFRESH_INTERVAL_MS = 750;
   private static readonly THREAD_DETAIL_POLL_REFRESH_INTERVAL_MS = 2_000;
+  private static readonly RUNTIME_TAIL_THREAD_DETAIL_REFRESH_INTERVAL_MS = 250;
+  private static readonly THREAD_DETAIL_RESPONSE_FRESH_WAIT_MS = 450;
+  private static readonly THREAD_DETAIL_STREAM_RESPONSE_FRESH_WAIT_MS = 1_500;
+  private static readonly BACKEND_STARTUP_CONNECT_TIMEOUT_MS = 2_500;
+  private static readonly RUNTIME_TAIL_REALTIME_POLL_INTERVAL_MS = 100;
   private static readonly THREAD_DETAIL_MAX_TURNS = 16;
   private static readonly THREAD_DETAIL_MAX_ITEMS = 96;
-  private static readonly THREAD_DETAIL_MAX_ITEMS_PER_TURN = 8;
+  private static readonly THREAD_DETAIL_MAX_ITEMS_PER_TURN = 24;
   private static readonly THREAD_DETAIL_MAX_TEXT_CHARS = 4_000;
+  private static readonly THREAD_DETAIL_MAX_MESSAGE_TEXT_CHARS = 64_000;
   private static readonly THREAD_DETAIL_MAX_TERMINAL_TEXT_CHARS = 12_000;
+  private static readonly THREAD_DETAIL_WS_MAX_TURNS = 8;
+  private static readonly THREAD_DETAIL_WS_MAX_ITEMS = 48;
+  private static readonly THREAD_DETAIL_WS_MAX_TEXT_CHARS = 1_000;
+  private static readonly THREAD_DETAIL_WS_MAX_MESSAGE_TEXT_CHARS = 8_000;
+  private static readonly THREAD_DETAIL_WS_MAX_TERMINAL_TEXT_CHARS = 8_000;
+  private static readonly THREAD_DETAIL_WS_MAX_REASONING_TEXT_CHARS = 4_000;
   private static readonly THREAD_ACTIVE_DISCOVERY_GRACE_MS = 2 * 60 * 1000;
   private static readonly THREAD_RECENT_DISCOVERY_GRACE_MS = 30 * 1000;
   private static readonly CODEX_RECENT_ARCHIVED_DESKTOP_PROMOTION_WINDOW_MS = 45 * 60 * 1000;
@@ -134,6 +155,7 @@ export class BridgeServer {
   private readonly backends = new Map<string, AgentBackend>();
   private readonly defaultBackendId: string;
   private readonly clients = new Set<WebSocket>();
+  private readonly realtimeEvents = new RealtimeEventLog();
   private readonly controllers = new ThreadControllerRegistry();
   private readonly runtime = new RuntimeTracker();
   private readonly pendingApprovals = new Map<string, PendingApprovalRecord>();
@@ -145,15 +167,19 @@ export class BridgeServer {
   private readonly voiceProviders = new Map<string, VoiceProvider>();
   private readonly defaultVoiceProviderId: string;
   private readonly mirroredThreadDetailCache = new Map<string, string>();
+  private readonly mirroredThreadDetailObjectCache = new Map<string, ThreadDetail>();
   private mirroredThreadListCache: string | null = null;
   private readonly discoveredThreadCache = new Map<string, CachedThreadSummaryRecord>();
   private readonly threadDetailBroadcastTimers = new Map<string, NodeJS.Timeout>();
   private readonly threadDetailBroadcastInFlight = new Map<string, Promise<void>>();
   private readonly threadDetailReadInFlight = new Map<string, Promise<ThreadDetail | null>>();
   private readonly threadDetailPollRefreshAt = new Map<string, number>();
+  private readonly runtimeTailDetailRefreshAttemptAt = new Map<string, number>();
   private threadListCache: CachedThreadListRecord | null = null;
   private threadListRefreshInFlight: Promise<ThreadSummary[]> | null = null;
   private threadMirrorPollTimer: NodeJS.Timeout | null = null;
+  private runtimeTailRealtimePollTimer: NodeJS.Timeout | null = null;
+  private readonly runtimeTailUpdatedAtByLaunchKey = new Map<string, number>();
   private threadMirrorPollInFlight = false;
 
   constructor() {
@@ -173,7 +199,6 @@ export class BridgeServer {
   async start(): Promise<void> {
     const pairingStatus = await this.pairing.initialize();
     await Promise.all(Array.from(this.backends.values()).map(async (backend) => {
-      await backend.connect();
       backend.on("event", (event: ConversationEvent) => {
         this.handleConversationEvent(backend.summary.id, event);
       });
@@ -181,12 +206,20 @@ export class BridgeServer {
       backend.on("serverRequest", (request: ServerRequestEvent) => {
         this.handleServerRequest(backend.summary.id, request);
       });
+
+      try {
+        await this.connectBackendAtStartup(backend);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[bridge] backend ${backend.summary.id} unavailable at startup: ${message}`);
+      }
     }));
     this.refreshRuntimePresenceFromLaunches();
     this.installMiddleware();
     this.installRoutes();
     this.installSockets();
     this.startThreadMirrorPolling();
+    this.startRuntimeTailRealtimePolling();
 
     await new Promise<void>((resolve) => {
       this.httpServer.listen(config.bridgePort, config.bridgeHost, () => {
@@ -211,8 +244,8 @@ export class BridgeServer {
         return;
       }
 
-      const token = this.requestToken(req);
-      if (!this.pairing.validate(token)) {
+      const auth = this.authenticateRequest(req);
+      if (!auth.ok) {
         res.status(401).json({ error: "Missing or invalid helm pairing token" });
         return;
       }
@@ -232,6 +265,182 @@ export class BridgeServer {
         backends: this.backendSummaries(),
         voiceProviders: await this.voiceProviderSummaries(),
       });
+    });
+
+    this.app.get("/api/simulator/booted", async (req, res) => {
+      try {
+        const simulators = await listBootedSimulators();
+        const requestedUDID =
+          typeof req.query.udid === "string" ? req.query.udid.trim() : "";
+        const selected =
+          (requestedUDID
+            ? simulators.find((simulator) => simulator.udid === requestedUDID)
+            : null) ?? simulators[0] ?? null;
+
+        res.json({
+          simulators,
+          selected,
+        });
+      } catch (error) {
+        this.handleError(
+          res,
+          error instanceof HttpError
+            ? error
+            : new HttpError(
+                500,
+                `Failed to list booted simulators: ${error instanceof Error ? error.message : String(error)}`
+              ));
+      }
+    });
+
+    this.app.get("/api/simulator/screenshot", async (req, res) => {
+      try {
+        const simulators = await listBootedSimulators();
+        const requestedUDID =
+          typeof req.query.udid === "string" ? req.query.udid.trim() : "";
+        const selected =
+          (requestedUDID
+            ? simulators.find((simulator) => simulator.udid === requestedUDID)
+            : null) ?? simulators[0] ?? null;
+
+        if (!selected) {
+          throw new HttpError(404, "No booted simulator is available.");
+        }
+
+        const screenshot = await captureSimulatorScreenshot(selected.udid);
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        res.setHeader("Content-Type", "image/png");
+        res.setHeader("X-Helm-Simulator-Udid", selected.udid);
+        res.send(screenshot);
+      } catch (error) {
+        this.handleError(
+          res,
+          error instanceof HttpError
+            ? error
+            : new HttpError(
+                500,
+                `Failed to capture simulator screenshot: ${error instanceof Error ? error.message : String(error)}`
+              )
+        );
+      }
+    });
+
+    this.app.get("/simulator", (req, res) => {
+      const token = this.requestToken(req);
+      if (!token) {
+        res.status(401).type("text/plain").send("Missing helm pairing token.");
+        return;
+      }
+
+      const requestedUDID =
+        typeof req.query.udid === "string" ? req.query.udid.trim() : "";
+      const selectedUDIDLiteral = JSON.stringify(requestedUDID);
+      const tokenLiteral = JSON.stringify(token);
+
+      res.type("html").send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Helm Simulator Mirror</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        background: #0b0d10;
+        color: #f5f7fa;
+        font: 14px/1.4 -apple-system, BlinkMacSystemFont, sans-serif;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        min-height: 100vh;
+      }
+      header {
+        padding: 10px 14px;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+      }
+      #meta {
+        opacity: 0.8;
+        font-size: 12px;
+      }
+      main {
+        display: grid;
+        place-items: center;
+        padding: 14px;
+      }
+      img {
+        max-width: min(100%, 540px);
+        max-height: calc(100vh - 72px);
+        width: auto;
+        height: auto;
+        border-radius: 18px;
+        box-shadow: 0 18px 60px rgba(0,0,0,0.45);
+        background: #11161b;
+      }
+      .error {
+        color: #ff8a80;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <div><strong>Helm Simulator Mirror</strong></div>
+        <div id="meta">Loading…</div>
+      </div>
+      <div id="status"></div>
+    </header>
+    <main>
+      <img id="frame" alt="Booted iOS Simulator" />
+    </main>
+    <script>
+      const token = ${tokenLiteral};
+      const requestedUDID = ${selectedUDIDLiteral};
+      const frame = document.getElementById("frame");
+      const meta = document.getElementById("meta");
+      const status = document.getElementById("status");
+      let activeUDID = requestedUDID;
+
+      async function refreshMeta() {
+        const url = new URL("/api/simulator/booted", window.location.origin);
+        url.searchParams.set("token", token);
+        if (activeUDID) url.searchParams.set("udid", activeUDID);
+        const response = await fetch(url, { cache: "no-store" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "Failed to load simulator state.");
+        if (!payload.selected) throw new Error("No booted simulator is available.");
+        activeUDID = payload.selected.udid;
+        meta.textContent = payload.selected.name + " • " + payload.selected.runtime + " • " + payload.selected.udid;
+      }
+
+      async function refreshFrame() {
+        const url = new URL("/api/simulator/screenshot", window.location.origin);
+        url.searchParams.set("token", token);
+        if (activeUDID) url.searchParams.set("udid", activeUDID);
+        url.searchParams.set("ts", String(Date.now()));
+        frame.src = url.toString();
+      }
+
+      async function tick() {
+        try {
+          await refreshMeta();
+          await refreshFrame();
+          status.textContent = "live";
+          status.className = "";
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : String(error);
+          status.className = "error";
+        }
+      }
+
+      tick();
+      setInterval(tick, 500);
+    </script>
+  </body>
+</html>`);
     });
 
     this.app.get("/api/backends", (_req, res) => {
@@ -326,9 +535,7 @@ export class BridgeServer {
 
     this.app.get("/api/pairing", (req, res) => {
       const loopback = this.isLoopbackRequest(req);
-      const token = this.extractBearerToken(req.headers.authorization);
-
-      if (!loopback && !this.pairing.validate(token)) {
+      if (!loopback && !this.authenticateRequest(req).ok) {
         res.status(401).json({ error: "Missing or invalid helm pairing token" });
         return;
       }
@@ -543,9 +750,13 @@ export class BridgeServer {
     this.app.get("/api/threads/:threadId", async (req, res) => {
       try {
         const canonicalThreadId = this.canonicalThreadId(req.params.threadId);
+        const preferFresh =
+          this.isTruthyQueryValue(req.query.fresh) ||
+          this.isTruthyQueryValue(req.query.stream);
         const detail =
           await this.readNormalizedThreadDetailForResponse(canonicalThreadId, {
             includeLiveRuntimeTail: true,
+            preferFresh,
           })
           ?? this.liveCachedThreadDetail(canonicalThreadId);
         res.json({ thread: detail });
@@ -938,7 +1149,7 @@ export class BridgeServer {
     const primaryBridgeURL = suggestedBridgeURLs[0];
     const setupURL =
       pairing.token && primaryBridgeURL
-        ? this.buildPairingSetupURL(primaryBridgeURL, pairing.token)
+        ? this.buildPairingSetupURL(primaryBridgeURL, pairing.token, pairing.bridgeId)
         : undefined;
 
     return {
@@ -1005,38 +1216,51 @@ export class BridgeServer {
       void this.handleUpgrade(request, socket, head);
     });
 
-    this.wsServer.on("connection", (socket) => {
+    this.wsServer.on("connection", (socket, request) => {
       this.clients.add(socket);
       this.refreshRuntimePresenceFromLaunches();
       const runtimeThreads = this.runtime.list();
+      const requestURL = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+      const resumeAfter = this.resumeSequenceFromURL(requestURL);
+      const resume = this.realtimeEvents.describeResume(resumeAfter);
 
       socket.send(
         JSON.stringify({
           type: "bridge.ready",
           payload: {
             message: "Connected to helm bridge",
+            bridgeId: this.pairing.describe(false).bridgeId,
+            resumedFromSequence: resume.canResume ? resumeAfter : null,
+            latestSequence: resume.latestSequence,
+            oldestRetainedSequence: resume.oldestRetainedSequence,
           },
         })
       );
 
-      socket.send(
-        JSON.stringify({
-          type: "helm.runtime.snapshot",
-          payload: {
-            threads: runtimeThreads,
-          },
-        })
-      );
-
-      if (this.threadListCache) {
+      if (resume.canResume) {
+        for (const event of resume.events) {
+          socket.send(event.text);
+        }
+      } else {
         socket.send(
           JSON.stringify({
-            type: "helm.threads.snapshot",
+            type: "helm.runtime.snapshot",
             payload: {
-              threads: this.withControllerMetadata(this.threadListCache.threads),
+              threads: runtimeThreads,
             },
           })
         );
+
+        if (this.threadListCache) {
+          socket.send(
+            JSON.stringify({
+              type: "helm.threads.snapshot",
+              payload: {
+                threads: this.withControllerMetadata(this.threadListCache.threads),
+              },
+            })
+          );
+        }
       }
 
       void this.refreshThreadListCache().catch((error) => {
@@ -1129,6 +1353,82 @@ export class BridgeServer {
     void this.pollMirroredThreads();
   }
 
+  private startRuntimeTailRealtimePolling(): void {
+    if (this.runtimeTailRealtimePollTimer) {
+      clearInterval(this.runtimeTailRealtimePollTimer);
+    }
+
+    this.runtimeTailRealtimePollTimer = setInterval(() => {
+      this.pollRuntimeTailsForRealtimeBroadcast();
+    }, BridgeServer.RUNTIME_TAIL_REALTIME_POLL_INTERVAL_MS);
+
+    this.pollRuntimeTailsForRealtimeBroadcast();
+  }
+
+  private pollRuntimeTailsForRealtimeBroadcast(): void {
+    if (this.clients.size === 0) {
+      return;
+    }
+
+    const seenKeys = new Set<string>();
+    for (const launch of listRuntimeLaunches()) {
+      if (!isRuntimeRelayAvailable(launch) || !launch.outputTailPath) {
+        continue;
+      }
+
+      const tail = readRuntimeOutputTail(launch);
+      if (!tail) {
+        continue;
+      }
+
+      const key = `${launch.runtime}:${launch.pid}:${launch.outputTailPath}`;
+      seenKeys.add(key);
+      if (this.runtimeTailUpdatedAtByLaunchKey.get(key) === tail.updatedAt) {
+        continue;
+      }
+
+      this.runtimeTailUpdatedAtByLaunchKey.set(key, tail.updatedAt);
+      this.publishRuntimeTailDetailIfChanged(launch, tail);
+    }
+
+    for (const key of this.runtimeTailUpdatedAtByLaunchKey.keys()) {
+      if (!seenKeys.has(key)) {
+        this.runtimeTailUpdatedAtByLaunchKey.delete(key);
+      }
+    }
+  }
+
+  private publishRuntimeTailDetailIfChanged(
+    launch: RuntimeLaunchRecord,
+    tail: RuntimeOutputTail
+  ): void {
+    const backendId = this.backendIdForRuntime(launch.runtime);
+    if (!backendId) {
+      return;
+    }
+
+    const threadId =
+      canonicalRuntimeThreadId(launch.runtime, launch.threadId)
+      ?? (this.backends.has(launch.runtime) ? `${launch.runtime}:${launch.pid}` : null);
+    if (!threadId) {
+      return;
+    }
+
+    const cached = this.cachedThreadDetail(threadId);
+    const summary =
+      cached
+        ? this.threadSummaryFromDetail(cached)
+        : this.cachedThreadSummary(threadId)
+          ?? this.threadSummaryFromRuntimeLaunch(launch, threadId, backendId, tail);
+
+    this.broadcastThreadDetail(
+      this.placeholderThreadDetailFromSummary(summary, {
+        includeLiveRuntimeTail: true,
+      })
+    );
+    this.scheduleRuntimeTailThreadDetailRefresh(threadId);
+  }
+
   private async pollMirroredThreads(): Promise<void> {
     if (this.clients.size === 0) {
       return;
@@ -1146,7 +1446,9 @@ export class BridgeServer {
       for (const cachedThreadID of this.mirroredThreadDetailCache.keys()) {
         if (!activeThreadIDs.has(cachedThreadID)) {
           this.mirroredThreadDetailCache.delete(cachedThreadID);
+          this.mirroredThreadDetailObjectCache.delete(cachedThreadID);
           this.threadDetailPollRefreshAt.delete(cachedThreadID);
+          this.runtimeTailDetailRefreshAttemptAt.delete(cachedThreadID);
         }
       }
 
@@ -1281,7 +1583,20 @@ export class BridgeServer {
       return;
     }
 
+    this.threadDetailPollRefreshAt.set(canonicalThreadId, Date.now());
     this.publishThreadDetailIfChanged(detail);
+  }
+
+  private scheduleRuntimeTailThreadDetailRefresh(threadId: string): void {
+    const canonicalThreadId = this.canonicalThreadId(threadId);
+    const now = Date.now();
+    const lastAttemptAt = this.runtimeTailDetailRefreshAttemptAt.get(canonicalThreadId) ?? 0;
+    if (now - lastAttemptAt < BridgeServer.RUNTIME_TAIL_THREAD_DETAIL_REFRESH_INTERVAL_MS) {
+      return;
+    }
+
+    this.runtimeTailDetailRefreshAttemptAt.set(canonicalThreadId, now);
+    void this.broadcastThreadDetailForIdSafely(canonicalThreadId);
   }
 
   private async broadcastThreadDetailForIdSafely(threadId: string): Promise<void> {
@@ -1315,10 +1630,23 @@ export class BridgeServer {
 
     const serialized = JSON.stringify(detail);
     if (this.mirroredThreadDetailCache.get(detail.id) === serialized) {
+      if (!this.mirroredThreadDetailObjectCache.has(detail.id)) {
+        this.mirroredThreadDetailObjectCache.set(detail.id, detail);
+      }
       return;
     }
 
     this.mirroredThreadDetailCache.set(detail.id, serialized);
+    this.mirroredThreadDetailObjectCache.set(detail.id, detail);
+    this.broadcast({
+      type: "helm.thread.detail",
+      payload: {
+        thread: detail,
+      },
+    });
+  }
+
+  private broadcastThreadDetail(detail: ThreadDetail): void {
     this.broadcast({
       type: "helm.thread.detail",
       payload: {
@@ -1353,6 +1681,11 @@ export class BridgeServer {
   }
 
   private cachedThreadDetail(threadId: string): ThreadDetail | null {
+    const cached = this.mirroredThreadDetailObjectCache.get(threadId);
+    if (cached) {
+      return cached;
+    }
+
     const serialized = this.mirroredThreadDetailCache.get(threadId);
     if (!serialized) {
       return null;
@@ -1364,7 +1697,9 @@ export class BridgeServer {
         return null;
       }
 
-      return parsed as ThreadDetail;
+      const detail = parsed as ThreadDetail;
+      this.mirroredThreadDetailObjectCache.set(threadId, detail);
+      return detail;
     } catch {
       return null;
     }
@@ -1379,14 +1714,25 @@ export class BridgeServer {
     return this.withLiveRuntimeTail(cached, cached.backendId);
   }
 
-  private threadSummaryFromDetail(detail: ThreadDetail): ThreadSummary {
+  private threadSummaryFromDetail(
+    detail: ThreadDetail,
+    fallbackThread: ThreadSummary | null = null
+  ): ThreadSummary {
+    const status = fallbackThread
+      ? this.preferredThreadStatus(detail.status, fallbackThread.status, detail.updatedAt || fallbackThread.updatedAt)
+      : detail.status;
     return {
       id: detail.id,
       name: detail.name,
-      preview: this.threadPreviewFromDetail(detail),
+      preview: this.mergedThreadPreview(
+        this.threadPreviewFromDetail(detail),
+        status,
+        fallbackThread?.preview ?? null,
+        fallbackThread?.name ?? detail.name ?? null
+      ),
       cwd: detail.cwd,
       workspacePath: detail.workspacePath ?? null,
-      status: detail.status,
+      status,
       updatedAt: detail.updatedAt,
       sourceKind: detail.sourceKind,
       launchSource: detail.launchSource,
@@ -1469,7 +1815,7 @@ export class BridgeServer {
         status: this.preferredThreadStatus(detail.status, existingThread.status, existingThread.updatedAt),
         controller: this.controllers.get(detail.id) ?? existingThread.controller ?? null,
       }
-      : this.threadSummaryFromDetail(detail);
+      : this.threadSummaryFromDetail(detail, existingThread);
     if (existingIndex >= 0) {
       threads[existingIndex] = {
         ...threads[existingIndex]!,
@@ -1512,12 +1858,26 @@ export class BridgeServer {
     }
 
     const enriched = [...threads];
-    const limit = Math.min(BridgeServer.THREAD_LIST_ENRICH_LIMIT, enriched.length);
+    const candidates = enriched
+      .map((thread, index) => ({
+        thread,
+        index,
+        cachedDetail: this.liveCachedThreadDetail(thread.id),
+      }))
+      .filter(({ thread, cachedDetail }) => cachedDetail || this.threadSummaryNeedsOpportunisticDetailRefresh(thread))
+      .slice(0, BridgeServer.THREAD_LIST_ENRICH_LIMIT);
 
     await Promise.all(
-      enriched.slice(0, limit).map(async (thread, index) => {
-        const detail = this.liveCachedThreadDetail(thread.id);
+      candidates.map(async ({ thread, index, cachedDetail }) => {
+        const detail = cachedDetail;
         if (!detail) {
+          if (this.threadSummaryNeedsOpportunisticDetailRefresh(thread)) {
+            const fetchedDetail = await this.readNormalizedThreadDetail(thread.id, thread);
+            if (fetchedDetail) {
+              enriched[index] = await this.enrichThreadSummaryWithDetail(thread, fetchedDetail);
+              return;
+            }
+          }
           this.scheduleThreadDetailBroadcast(thread.id);
           return;
         }
@@ -1527,6 +1887,20 @@ export class BridgeServer {
     );
 
     return enriched.sort((lhs, rhs) => rhs.updatedAt - lhs.updatedAt);
+  }
+
+  private threadSummaryNeedsOpportunisticDetailRefresh(thread: ThreadSummary): boolean {
+    const preview = this.previewText(thread.preview);
+    if (!preview || this.isGenericThreadPreview(preview)) {
+      return true;
+    }
+
+    const name = this.previewText(thread.name);
+    if (!name) {
+      return true;
+    }
+
+    return preview === name;
   }
 
   private async promoteLiveArchivedCodexThreads(threads: ThreadSummary[]): Promise<ThreadSummary[]> {
@@ -1625,7 +1999,12 @@ export class BridgeServer {
     return {
       ...thread,
       name: detail.name ?? thread.name,
-      preview: this.threadPreviewFromDetail(detail) || thread.preview,
+      preview: this.mergedThreadPreview(
+        this.threadPreviewFromDetail(detail),
+        this.preferredThreadStatus(detail.status, thread.status, detail.updatedAt || thread.updatedAt),
+        thread.preview,
+        detail.name ?? thread.name ?? null
+      ),
       cwd,
       workspacePath: workspacePath || null,
       status: this.preferredThreadStatus(detail.status, thread.status, detail.updatedAt || thread.updatedAt),
@@ -1639,13 +2018,18 @@ export class BridgeServer {
     threadId: string,
     options: {
       includeLiveRuntimeTail?: boolean;
+      preferFresh?: boolean;
     } = {}
   ): Promise<ThreadDetail | null> {
     const cached = this.liveCachedThreadDetail(threadId);
-    const summary = cached ? this.threadSummaryFromDetail(cached) : this.cachedThreadSummary(threadId);
+    const summary = cached
+      ? this.threadSummaryFromDetail(cached)
+      : this.cachedThreadSummary(threadId)
+        ?? await this.discoverLocalCodexThreadSummary(threadId);
     const placeholder = !cached && summary
       ? this.placeholderThreadDetailFromSummary(summary, options)
       : null;
+    const fallback = cached ?? placeholder;
     const read = this.readNormalizedThreadDetailCoalesced(
       threadId,
       summary,
@@ -1657,19 +2041,50 @@ export class BridgeServer {
         }
         return detail;
       })
-      .catch(() => null);
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[bridge] thread detail refresh failed for ${threadId}: ${message}`);
+        return null;
+      });
 
-    if (cached) {
-      void read;
-      return cached;
-    }
-
-    if (placeholder) {
-      void read;
-      return placeholder;
+    if (fallback) {
+      const freshWaitMS = options.preferFresh
+        ? BridgeServer.THREAD_DETAIL_STREAM_RESPONSE_FRESH_WAIT_MS
+        : BridgeServer.THREAD_DETAIL_RESPONSE_FRESH_WAIT_MS;
+      const detail = await Promise.race<ThreadDetail | null>([
+        read,
+        new Promise<null>((resolve) => {
+          const timer = setTimeout(
+            () => resolve(null),
+            freshWaitMS
+          );
+          timer.unref?.();
+        }),
+      ]);
+      if (detail) {
+        return detail;
+      }
+      return fallback;
     }
 
     return await read;
+  }
+
+  private isTruthyQueryValue(value: unknown): boolean {
+    const candidate = Array.isArray(value) ? value[0] : value;
+    if (typeof candidate !== "string") {
+      return false;
+    }
+
+    switch (candidate.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    default:
+      return false;
+    }
   }
 
   private async readNormalizedThreadDetailCoalesced(
@@ -1745,6 +2160,7 @@ export class BridgeServer {
     const threadSummary =
       summary
       ?? this.threadListCache?.threads.find((thread) => thread.id === threadId)
+      ?? await this.discoverLocalCodexThreadSummary(threadId)
       ?? this.withControllerMetadata(await this.withWorkspacePaths(await backend.listThreads())).find(
         (thread) => thread.id === threadId
       )
@@ -1784,6 +2200,46 @@ export class BridgeServer {
     return this.withLiveRuntimeTail(detailWithWorkspace, backend.summary.id);
   }
 
+  private async discoverLocalCodexThreadSummary(threadId: string): Promise<ThreadSummary | null> {
+    const backend = this.backendForThread(threadId);
+    if (backend.summary.id !== "codex") {
+      return null;
+    }
+
+    const summary = await discoverCodexThread(threadId);
+    if (!summary) {
+      return null;
+    }
+
+    return this.withControllerMetadata([
+      {
+        ...summary,
+        workspacePath: summary.workspacePath ?? await resolveWorkspacePath(summary.cwd) ?? null,
+      },
+    ])[0] ?? null;
+  }
+
+  private async connectBackendAtStartup(backend: AgentBackend): Promise<void> {
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      await Promise.race([
+        backend.connect(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(
+              `startup connect timed out after ${BridgeServer.BACKEND_STARTUP_CONNECT_TIMEOUT_MS}ms`
+            ));
+          }, BridgeServer.BACKEND_STARTUP_CONNECT_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
   private async handleUpgrade(
     request: IncomingMessage,
     socket: Duplex,
@@ -1792,8 +2248,8 @@ export class BridgeServer {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
 
     if (url.pathname === "/ws/mobile") {
-      const token = this.tokenForUpgradeRequest(request, url);
-      if (!this.pairing.validate(token)) {
+      const auth = this.authenticateUpgradeRequest(request, url);
+      if (!auth.ok) {
         this.rejectUpgrade(socket, 401, "Unauthorized");
         return;
       }
@@ -1805,8 +2261,8 @@ export class BridgeServer {
     }
 
     if (url.pathname === "/ws/voice/personaplex") {
-      const token = this.tokenForUpgradeRequest(request, url);
-      if (!this.pairing.validate(token)) {
+      const auth = this.authenticateUpgradeRequest(request, url);
+      if (!auth.ok) {
         this.rejectUpgrade(socket, 401, "Unauthorized");
         return;
       }
@@ -1899,6 +2355,34 @@ export class BridgeServer {
     );
   }
 
+  private authenticateUpgradeRequest(request: IncomingMessage, url: URL) {
+    return this.pairing.authenticate({
+      token: this.tokenForUpgradeRequest(request, url),
+      method: request.method ?? "GET",
+      path: this.pathForUpgradeAuth(url),
+      clientId: this.requestHeaderValue(request.headers["x-helm-client-id"]),
+      clientName: this.requestHeaderValue(request.headers["x-helm-client-name"]),
+      clientKey: this.requestHeaderValue(request.headers["x-helm-client-key"]),
+      signature: this.requestHeaderValue(request.headers["x-helm-client-signature"]),
+      timestamp: this.numericHeaderValue(request.headers["x-helm-client-timestamp"]),
+      nonce: this.requestHeaderValue(request.headers["x-helm-client-nonce"]),
+    });
+  }
+
+  private authenticateRequest(req: express.Request) {
+    return this.pairing.authenticate({
+      token: this.requestToken(req),
+      method: req.method,
+      path: this.pathForExpressAuth(req),
+      clientId: this.requestHeaderValue(req.headers["x-helm-client-id"]),
+      clientName: this.requestHeaderValue(req.headers["x-helm-client-name"]),
+      clientKey: this.requestHeaderValue(req.headers["x-helm-client-key"]),
+      signature: this.requestHeaderValue(req.headers["x-helm-client-signature"]),
+      timestamp: this.numericHeaderValue(req.headers["x-helm-client-timestamp"]),
+      nonce: this.requestHeaderValue(req.headers["x-helm-client-nonce"]),
+    });
+  }
+
   private requestToken(req: express.Request): string | null {
     const headerToken = this.extractBearerToken(req.headers.authorization);
     if (headerToken) {
@@ -1907,6 +2391,42 @@ export class BridgeServer {
 
     const queryToken = typeof req.query.token === "string" ? req.query.token.trim() : "";
     return queryToken.length > 0 ? queryToken : null;
+  }
+
+  private requestHeaderValue(value: string | string[] | undefined): string | null {
+    if (Array.isArray(value)) {
+      return typeof value[0] === "string" && value[0].trim().length > 0
+        ? value[0].trim()
+        : null;
+    }
+
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  private numericHeaderValue(value: string | string[] | undefined): number | null {
+    const parsed = Number(this.requestHeaderValue(value));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  private pathForExpressAuth(req: express.Request): string {
+    const candidate = typeof req.originalUrl === "string" && req.originalUrl.length > 0
+      ? req.originalUrl
+      : req.url;
+    return candidate || req.path || "/";
+  }
+
+  private pathForUpgradeAuth(url: URL): string {
+    return `${url.pathname}${url.search}`;
+  }
+
+  private resumeSequenceFromURL(url: URL): number | null {
+    const raw = url.searchParams.get("resumeAfter");
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : null;
   }
 
   private handleConversationEvent(backendId: string, event: ConversationEvent): void {
@@ -2204,7 +2724,10 @@ export class BridgeServer {
     const status = this.preferredThreadStatus(
       this.codexThreadStatusValue(thread.status),
       summary?.status ?? null,
-      updatedAt
+      updatedAt,
+      {
+        preferRecentIdle: trimmedTurns.length === 0,
+      }
     );
 
     return {
@@ -2251,10 +2774,6 @@ export class BridgeServer {
     const turnID = `live-tail-${detail.id}`;
     const ageMS = Math.max(0, Date.now() - tail.updatedAt);
     const isActiveTail = ageMS <= 15_000;
-    const shouldIncludeTail = isActiveTail || tail.updatedAt > detail.updatedAt;
-    if (!shouldIncludeTail) {
-      return detail;
-    }
 
     const liveTurn: ThreadDetailTurn = {
       id: turnID,
@@ -2277,8 +2796,11 @@ export class BridgeServer {
 
     return {
       ...detail,
-      updatedAt: tail.updatedAt,
-      turns: this.trimThreadTurns([liveTurn, ...detail.turns]),
+      updatedAt: Math.max(detail.updatedAt, tail.updatedAt),
+      turns: this.trimThreadTurns([
+        ...detail.turns.filter((turn) => turn.id !== turnID),
+        liveTurn,
+      ]),
     };
   }
 
@@ -2291,12 +2813,41 @@ export class BridgeServer {
       return null;
     }
 
-    const launch = findMatchingLaunchByThreadID(runtimeId, threadId);
+    let launch = findMatchingLaunchByThreadID(runtimeId, threadId);
+    if (!launch && threadId.startsWith(`${runtimeId}:`)) {
+      const pid = Number(threadId.slice(runtimeId.length + 1));
+      launch = findMatchingLaunchByPID(runtimeId, Number.isFinite(pid) ? pid : undefined);
+    }
     if (!launch) {
       return null;
     }
 
     return readRuntimeOutputTail(launch);
+  }
+
+  private threadSummaryFromRuntimeLaunch(
+    launch: RuntimeLaunchRecord,
+    threadId: string,
+    backendId: string,
+    tail: RuntimeOutputTail
+  ): ThreadSummary {
+    const backend = this.backendForId(backendId).summary;
+    const cwdName = path.basename(launch.cwd) || launch.cwd || backend.label;
+    return {
+      id: threadId,
+      name: `${backend.label} - ${cwdName}`,
+      preview: this.previewText(tail.text) || `${backend.label} is running as a helm-managed terminal session.`,
+      cwd: launch.cwd,
+      workspacePath: null,
+      status: "running",
+      updatedAt: this.normalizeThreadUpdatedAt(tail.updatedAt),
+      sourceKind: "managed-terminal",
+      launchSource: HELM_RUNTIME_LAUNCH_SOURCE,
+      backendId: backend.id,
+      backendLabel: backend.label,
+      backendKind: backend.kind,
+      controller: this.controllers.get(threadId),
+    };
   }
 
   private runtimeIdForBackend(backendId: string): string | null {
@@ -2306,7 +2857,18 @@ export class BridgeServer {
     case "claude-code":
       return "claude";
     default:
-      return null;
+      return this.backends.has(backendId) ? backendId : null;
+    }
+  }
+
+  private backendIdForRuntime(runtime: string): string | null {
+    switch (runtime) {
+    case "codex":
+      return "codex";
+    case "claude":
+      return "claude-code";
+    default:
+      return this.backends.has(runtime) ? runtime : null;
     }
   }
 
@@ -2321,7 +2883,10 @@ export class BridgeServer {
   private preferredThreadStatus(
     primary: string | null,
     fallback: string | null,
-    updatedAt: number
+    updatedAt: number,
+    options: {
+      preferRecentIdle?: boolean;
+    } = {}
   ): string {
     if (primary && primary !== "unknown" && primary !== "notLoaded") {
       return primary;
@@ -2332,6 +2897,12 @@ export class BridgeServer {
     }
 
     const ageMS = Math.max(0, Date.now() - this.normalizeThreadUpdatedAt(updatedAt));
+    if (options.preferRecentIdle) {
+      if (ageMS < 7 * 24 * 60 * 60 * 1000) {
+        return "idle";
+      }
+      return "unknown";
+    }
     if (ageMS < 15 * 60 * 1000) {
       return "running";
     }
@@ -2433,9 +3004,9 @@ export class BridgeServer {
         };
       case "commandExecution": {
         const output =
-          this.bestDetail(value.aggregatedOutput) ??
-          this.bestDetail(value.stdout) ??
-          this.bestDetail(value.stderr);
+          this.fullText(value.aggregatedOutput) ??
+          this.fullText(value.stdout) ??
+          this.fullText(value.stderr);
         const cwd = typeof value.cwd === "string" ? value.cwd : null;
         const exitCode = typeof value.exitCode === "number" ? value.exitCode : null;
         return {
@@ -2544,7 +3115,7 @@ export class BridgeServer {
         Math.max(1, BridgeServer.THREAD_DETAIL_MAX_ITEMS - liveTailItemCount)
       );
 
-      return this.compactThreadDetailTurns([...liveTailTurns, ...selectedRemainingTurns]);
+      return this.compactThreadDetailTurns([...selectedRemainingTurns, ...liveTailTurns]);
     }
 
     if (budgetedTurns.length <= BridgeServer.THREAD_DETAIL_MAX_TURNS) {
@@ -2573,7 +3144,7 @@ export class BridgeServer {
 
     const selectedIds = new Set<string>();
     const selectedIndexes = new Set<number>();
-    const maxRealItems = Math.max(1, maxItems - 1);
+    const maxRealItems = maxItems;
 
     const addItemAtIndex = (index: number): void => {
       if (selectedIndexes.size >= maxRealItems) {
@@ -2595,13 +3166,6 @@ export class BridgeServer {
     }
 
     for (let index = turn.items.length - 1; index >= 0; index -= 1) {
-      const item = turn.items[index];
-      if (item && this.isConversationContextItem(item)) {
-        addItemAtIndex(index);
-      }
-    }
-
-    for (let index = turn.items.length - 1; index >= 0; index -= 1) {
       addItemAtIndex(index);
     }
 
@@ -2614,48 +3178,9 @@ export class BridgeServer {
       return turn;
     }
 
-    const placeholder = this.compactedThreadItemsPlaceholder(turn, omittedCount);
-    const insertionIndex = keptItems.length > 0 ? 1 : 0;
-    const items = [...keptItems];
-    items.splice(insertionIndex, 0, placeholder);
-
     return {
       ...turn,
-      items,
-    };
-  }
-
-  private isConversationContextItem(item: ThreadDetailItem): boolean {
-    switch (item.type) {
-    case "userMessage":
-    case "agentMessage":
-    case "plan":
-    case "reasoning":
-    case "fileChange":
-      return true;
-    default:
-      return false;
-    }
-  }
-
-  private compactedThreadItemsPlaceholder(
-    turn: ThreadDetailTurn,
-    omittedCount: number
-  ): ThreadDetailItem {
-    const noun = omittedCount === 1 ? "item" : "items";
-    const detail = `${omittedCount} earlier activity ${noun} omitted so prior conversation stays visible on mobile.`;
-    return {
-      id: `${turn.id}-mobile-compacted-${omittedCount}`,
-      turnId: turn.id,
-      type: "summary",
-      title: "Activity compacted",
-      detail,
-      status: null,
-      rawText: detail,
-      metadataSummary: null,
-      command: null,
-      cwd: null,
-      exitCode: null,
+      items: keptItems,
     };
   }
 
@@ -2691,15 +3216,74 @@ export class BridgeServer {
   }
 
   private compactThreadDetailItem(item: ThreadDetailItem): ThreadDetailItem {
-    const isTerminalOutput = item.type === "commandExecution";
-    const textLimit = isTerminalOutput
-      ? BridgeServer.THREAD_DETAIL_MAX_TERMINAL_TEXT_CHARS
-      : BridgeServer.THREAD_DETAIL_MAX_TEXT_CHARS;
+    const textLimit = this.threadDetailTextLimit(item);
+    const preserveTail = this.threadDetailTextPreservesTail(item);
     return {
       ...item,
-      detail: this.compactThreadDetailText(item.detail, textLimit, isTerminalOutput),
-      rawText: this.compactThreadDetailText(item.rawText, textLimit, isTerminalOutput),
+      detail: this.compactThreadDetailText(item.detail, textLimit, preserveTail),
+      rawText: this.compactThreadDetailText(item.rawText, textLimit, preserveTail),
     };
+  }
+
+  private compactThreadDetailForWebSocket(detail: ThreadDetail): ThreadDetail {
+    const selectedTurns = this.selectRecentThreadTurns(
+      this.compactOversizedThreadTurns(detail.turns),
+      BridgeServer.THREAD_DETAIL_WS_MAX_TURNS,
+      BridgeServer.THREAD_DETAIL_WS_MAX_ITEMS
+    );
+
+    return {
+      ...detail,
+      turns: selectedTurns.map((turn) => ({
+        ...turn,
+        items: turn.items.map((item) => this.compactThreadDetailItemForWebSocket(item)),
+      })),
+    };
+  }
+
+  private compactThreadDetailItemForWebSocket(item: ThreadDetailItem): ThreadDetailItem {
+    const textLimit = this.threadDetailWebSocketTextLimit(item);
+    const preserveTail = this.threadDetailTextPreservesTail(item);
+    return {
+      ...item,
+      detail: this.compactThreadDetailText(item.detail, textLimit, preserveTail),
+      rawText: this.compactThreadDetailText(item.rawText, textLimit, preserveTail),
+    };
+  }
+
+  private threadDetailTextLimit(item: ThreadDetailItem): number {
+    switch (item.type) {
+      case "agentMessage":
+        return BridgeServer.THREAD_DETAIL_MAX_MESSAGE_TEXT_CHARS;
+      case "commandExecution":
+        return BridgeServer.THREAD_DETAIL_MAX_TERMINAL_TEXT_CHARS;
+      default:
+        return BridgeServer.THREAD_DETAIL_MAX_TEXT_CHARS;
+    }
+  }
+
+  private threadDetailWebSocketTextLimit(item: ThreadDetailItem): number {
+    switch (item.type) {
+      case "agentMessage":
+        return BridgeServer.THREAD_DETAIL_WS_MAX_MESSAGE_TEXT_CHARS;
+      case "commandExecution":
+        return BridgeServer.THREAD_DETAIL_WS_MAX_TERMINAL_TEXT_CHARS;
+      case "reasoning":
+        return BridgeServer.THREAD_DETAIL_WS_MAX_REASONING_TEXT_CHARS;
+      default:
+        return BridgeServer.THREAD_DETAIL_WS_MAX_TEXT_CHARS;
+    }
+  }
+
+  private threadDetailTextPreservesTail(item: ThreadDetailItem): boolean {
+    switch (item.type) {
+      case "agentMessage":
+      case "commandExecution":
+      case "reasoning":
+        return true;
+      default:
+        return false;
+    }
   }
 
   private compactThreadDetailText(
@@ -2711,12 +3295,10 @@ export class BridgeServer {
       return value;
     }
 
-    const marker = "\n… truncated for mobile performance …\n";
-    const retainedLength = Math.max(0, limit - marker.length);
     if (preserveTail) {
-      return `${marker}${value.slice(-retainedLength)}`;
+      return value.slice(-limit);
     }
-    return `${value.slice(0, retainedLength)}${marker}`;
+    return value.slice(0, limit);
   }
 
   private threadPreviewFromDetail(detail: ThreadDetail): string {
@@ -2745,6 +3327,82 @@ export class BridgeServer {
     }
 
     return snippets.join("\n");
+  }
+
+  private resolvedThreadPreview(
+    primaryPreview: string,
+    status: string,
+    fallbackPreview: string | null = null,
+    fallbackName: string | null = null
+  ): string {
+    const trimmedPrimary = this.previewText(primaryPreview);
+    if (trimmedPrimary) {
+      return trimmedPrimary;
+    }
+
+    const trimmedFallback = this.previewText(fallbackPreview);
+    const trimmedName = this.previewText(fallbackName);
+    const normalizedStatus = status.trim().toLowerCase();
+    const titleEcho = (candidate: string): boolean =>
+      candidate.length > 0
+      && trimmedName.length > 0
+      && candidate === trimmedName;
+    const titleEchoShouldYieldPlaceholder = (candidate: string): boolean =>
+      (normalizedStatus === "running" || normalizedStatus === "idle")
+      && titleEcho(candidate);
+    if (trimmedFallback && !titleEchoShouldYieldPlaceholder(trimmedFallback)) {
+      return trimmedFallback;
+    }
+
+    if (normalizedStatus === "idle" && (titleEcho(trimmedPrimary) || titleEcho(trimmedFallback))) {
+      return "No activity yet.";
+    }
+
+    return normalizedStatus === "running" ? "Waiting for output..." : "";
+  }
+
+  private mergedThreadPreview(
+    primaryPreview: string,
+    status: string,
+    fallbackPreview: string | null = null,
+    fallbackName: string | null = null
+  ): string {
+    const trimmedFallback = this.previewText(fallbackPreview);
+    if (this.shouldPreserveStableThreadPreview(status, trimmedFallback, fallbackName)) {
+      return trimmedFallback;
+    }
+
+    return this.resolvedThreadPreview(primaryPreview, status, fallbackPreview, fallbackName);
+  }
+
+  private shouldPreserveStableThreadPreview(
+    status: string,
+    fallbackPreview: string,
+    fallbackName: string | null = null
+  ): boolean {
+    if (!fallbackPreview || this.isGenericThreadPreview(fallbackPreview)) {
+      return false;
+    }
+
+    const trimmedName = this.previewText(fallbackName);
+    if (trimmedName && trimmedName === fallbackPreview) {
+      return false;
+    }
+
+    switch (status.trim().toLowerCase()) {
+    case "running":
+    case "blocked":
+    case "waitingapproval":
+      return false;
+    default:
+      return true;
+    }
+  }
+
+  private isGenericThreadPreview(preview: string): boolean {
+    return preview === "Codex CLI session"
+      || preview === "Waiting for output..."
+      || preview.endsWith("is running as a helm-managed terminal session.");
   }
 
   private previewText(value: string | null | undefined): string {
@@ -3108,7 +3766,9 @@ export class BridgeServer {
     this.discoveredThreadCache.delete(threadId);
     this.threadBackendIds.delete(threadId);
     this.mirroredThreadDetailCache.delete(threadId);
+    this.mirroredThreadDetailObjectCache.delete(threadId);
     this.threadDetailPollRefreshAt.delete(threadId);
+    this.runtimeTailDetailRefreshAttemptAt.delete(threadId);
     this.runtime.remove(threadId);
     this.controllers.remove(threadId);
     this.invalidateThreadListCache();
@@ -3339,14 +3999,20 @@ export class BridgeServer {
       typeof row.first_user_message === "string" && row.first_user_message.trim().length > 0
         ? row.first_user_message
         : row.title;
+    const status = this.preferredThreadStatus(null, null, updatedAt, {
+      preferRecentIdle: this.previewText(previewCandidate) === this.previewText(name),
+    });
 
     return {
       id: row.id,
       name,
-      preview: this.previewText(previewCandidate) || name || "Codex CLI session",
+      preview: codexThreadPreviewForDisplay(
+        this.previewText(previewCandidate) || name || "Codex CLI session",
+        updatedAt
+      ),
       cwd: typeof row.cwd === "string" ? row.cwd : "",
       workspacePath: null,
-      status: this.preferredThreadStatus(null, null, updatedAt),
+      status,
       updatedAt,
       sourceKind: this.codexThreadSource(row),
       launchSource: null,
@@ -3358,12 +4024,10 @@ export class BridgeServer {
   }
 
   private codexComputedThreadName(row: CodexThreadRegistryRow): string | null {
-    const candidate = [row.title, row.first_user_message]
-      .map((value) => (typeof value === "string" ? value : ""))
-      .map((value) => value.split(/\r?\n/).map((entry) => entry.trim()).find((entry) => entry.length > 0) ?? "")
-      .find((value) => value.length > 0);
-
-    return candidate?.trim() || null;
+    return preferredCodexThreadName(
+      typeof row.title === "string" ? row.title : null,
+      typeof row.first_user_message === "string" ? row.first_user_message : null
+    );
   }
 
   private codexThreadSource(row: CodexThreadRegistryRow): string {
@@ -3651,10 +4315,11 @@ export class BridgeServer {
     );
   }
 
-  private buildPairingSetupURL(bridgeURL: string, token: string): string {
+  private buildPairingSetupURL(bridgeURL: string, token: string, bridgeId: string): string {
     const setupURL = new URL("helm://pair");
     setupURL.searchParams.set("bridge", bridgeURL);
     setupURL.searchParams.set("token", token);
+    setupURL.searchParams.set("bridgeId", bridgeId);
     return setupURL.toString();
   }
 
@@ -3884,9 +4549,27 @@ export class BridgeServer {
   }
 
   private broadcast(payload: unknown): void {
-    const text = JSON.stringify(payload);
+    let envelope = this.asRealtimeEnvelope(payload);
+    if (!envelope) {
+      return;
+    }
+    let text = this.serializeRealtimePayload(envelope, 0);
     const byteLength = Buffer.byteLength(text, "utf8");
     if (byteLength > BridgeServer.MAX_WS_OUTBOUND_MESSAGE_BYTES) {
+      const compactPayload = this.compactOversizedBroadcastPayload(payload);
+      if (compactPayload) {
+        envelope = this.asRealtimeEnvelope(compactPayload);
+        if (!envelope) {
+          return;
+        }
+        text = this.serializeRealtimePayload(envelope, 0);
+        const compactByteLength = Buffer.byteLength(text, "utf8");
+        if (compactByteLength <= BridgeServer.MAX_WS_OUTBOUND_MESSAGE_BYTES) {
+          this.sendReplayableRealtimePayload(envelope);
+          return;
+        }
+      }
+
       const payloadType =
         typeof payload === "object" &&
         payload !== null &&
@@ -3899,11 +4582,69 @@ export class BridgeServer {
       );
       return;
     }
+
+    this.sendReplayableRealtimePayload(envelope);
+  }
+
+  private sendBroadcastText(text: string): void {
     for (const client of this.clients) {
       if (client.readyState === WebSocket.OPEN) {
         client.send(text);
       }
     }
+  }
+
+  private compactOversizedBroadcastPayload(payload: unknown): unknown | null {
+    if (!this.isThreadDetailBroadcastPayload(payload)) {
+      return null;
+    }
+
+    return {
+      type: "helm.thread.detail",
+      payload: {
+        thread: this.compactThreadDetailForWebSocket(payload.payload.thread),
+      },
+    };
+  }
+
+  private isThreadDetailBroadcastPayload(
+    payload: unknown
+  ): payload is { type: "helm.thread.detail"; payload: { thread: ThreadDetail } } {
+    if (typeof payload !== "object" || payload === null) {
+      return false;
+    }
+
+    const envelope = payload as {
+      type?: unknown;
+      payload?: {
+        thread?: {
+          id?: unknown;
+          turns?: unknown;
+        };
+      };
+    };
+
+    return envelope.type === "helm.thread.detail"
+      && typeof envelope.payload?.thread?.id === "string"
+      && Array.isArray(envelope.payload.thread.turns);
+  }
+
+  private asRealtimeEnvelope(payload: unknown): Record<string, unknown> | null {
+    return typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : null;
+  }
+
+  private serializeRealtimePayload(payload: Record<string, unknown>, sequence: number): string {
+    return JSON.stringify({
+      ...payload,
+      sequence,
+    });
+  }
+
+  private sendReplayableRealtimePayload(payload: Record<string, unknown>): void {
+    const record = this.realtimeEvents.publish(payload);
+    this.sendBroadcastText(record.text);
   }
 
   private commandExecutionDetail(value: { [key: string]: JSONValue }): string | null {
@@ -4174,11 +4915,15 @@ export class BridgeServer {
       case "":
       case "queue":
         return "queue";
-      case "interrupt":
+      case "steer":
+      case "now":
       case "sendimmediately":
       case "send-immediately":
       case "immediate":
-        return "interrupt";
+        return "steer";
+      case "interrupt":
+        console.warn("[bridge] /api/threads/:threadId/turns no longer accepts interrupting text delivery; steering the active turn instead. Use /interrupt for explicit interrupts.");
+        return "steer";
       default:
         throw new HttpError(400, "Unsupported turn delivery mode");
     }

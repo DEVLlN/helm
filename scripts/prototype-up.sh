@@ -25,6 +25,13 @@ done
 
 mkdir -p "$LOG_DIR"
 
+for candidate in "$HOME/.local/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+  if [[ -d "$candidate" ]] && [[ ":$PATH:" != *":$candidate:"* ]]; then
+    PATH="$candidate:$PATH"
+  fi
+done
+export PATH
+
 if [[ -f "$BRIDGE_DIR/.env" ]]; then
   set -a
   # shellcheck disable=SC1091

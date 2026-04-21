@@ -8,7 +8,7 @@ export type JSONValue =
 
 export type JSONRPCId = string | number;
 
-export type TurnDeliveryMode = "queue" | "interrupt";
+export type TurnDeliveryMode = "queue" | "steer" | "interrupt";
 
 export type StartTurnImageAttachment = {
   path: string;

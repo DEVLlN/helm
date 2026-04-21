@@ -1,13 +1,14 @@
 {
   "name": "codex-voice-remote-bridge",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test src/*.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.6.1",

@@ -7,6 +7,13 @@ SHIM_DIR="${HOME}/.local/share/helm/runtime-shims"
 CONFIG_DIR="${HOME}/.config/helm/shell"
 OUTPUT_FORMAT="human"
 
+for candidate in "$HOME/.local/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+  if [[ -d "$candidate" ]] && [[ ":$PATH:" != *":$candidate:"* ]]; then
+    PATH="$candidate:$PATH"
+  fi
+done
+export PATH
+
 usage() {
   cat <<'EOF'
 Usage: scripts/detect-helm-platforms.sh [--json]

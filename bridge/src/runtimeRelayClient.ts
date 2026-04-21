@@ -82,7 +82,7 @@ async function sendRelayRequest(launch: RuntimeLaunchRecord, request: RelayReque
       }
     };
 
-    socket.setTimeout(2_000, () => finish(new Error("helm shell relay timed out.")));
+    socket.setTimeout(6_000, () => finish(new Error("helm shell relay timed out.")));
 
     socket.once("error", (error) => finish(error));
     socket.once("connect", () => {

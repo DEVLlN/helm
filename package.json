@@ -1,6 +1,6 @@
 {
   "name": "@devlln/helm",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": false,
   "description": "Helm CLI bridge installer and runtime helpers.",
   "homepage": "https://github.com/DEVLlN/helm#readme",
@@ -45,6 +45,7 @@
     "scripts/install-helm-runtime-shims.sh",
     "scripts/install-helm-shell-integration.sh",
     "scripts/install-helm.sh",
+    "scripts/bridge-service.sh",
     "scripts/print-pairing-qr.sh",
     "scripts/prototype-down.sh",
     "scripts/prototype-status.sh",
@@ -53,7 +54,8 @@
   ],
   "scripts": {
     "check": "npm --prefix bridge run check",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "npm pack --dry-run",
+    "render:homebrew": "node scripts/render-homebrew-formula.mjs"
   },
   "publishConfig": {
     "access": "public"

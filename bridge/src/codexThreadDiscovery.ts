@@ -1,5 +1,13 @@
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +20,8 @@ import type { JSONValue, ThreadSummary } from "./types.js";
 const execFileAsync = promisify(execFile);
 const DEFAULT_LIMIT = 50;
 const MAX_LOCAL_ROLLOUT_TEXT_LENGTH = 20_000;
+const MAX_LOCAL_ROLLOUT_STREAM_TEXT_LENGTH = 64_000;
+const LOCAL_ROLLOUT_TAIL_READ_BYTES = 12 * 1024 * 1024;
 
 type CodexThreadRow = {
   id?: string;
@@ -70,16 +80,71 @@ function firstLine(value: string | null | undefined): string | null {
   return line ? truncate(line, 140) : null;
 }
 
-function threadName(row: CodexThreadRow): string | null {
-  return firstLine(row.title) ?? firstLine(row.first_user_message) ?? null;
+const DEGRADED_CODEX_THREAD_TITLES = [
+  /^helm(?:\s+ios|\s+macos)?$/i,
+];
+
+function isDegradedCodexThreadTitle(title: string, fallbackName: string | null): boolean {
+  if (!fallbackName) {
+    return false;
+  }
+
+  const normalizedTitle = title.trim().toLocaleLowerCase();
+  const normalizedFallback = fallbackName.trim().toLocaleLowerCase();
+  if (!normalizedTitle || normalizedTitle === normalizedFallback) {
+    return false;
+  }
+
+  return DEGRADED_CODEX_THREAD_TITLES.some((pattern) => pattern.test(title));
 }
 
-function threadPreview(row: CodexThreadRow): string {
-  return threadName(row) ?? "Codex CLI session";
+export function preferredCodexThreadName(
+  title: string | null | undefined,
+  fallbackName: string | null | undefined
+): string | null {
+  const preferredTitle = firstLine(title);
+  const preferredFallback = firstLine(fallbackName);
+  if (preferredTitle && !isDegradedCodexThreadTitle(preferredTitle, preferredFallback)) {
+    return preferredTitle;
+  }
+
+  return preferredFallback ?? preferredTitle ?? null;
+}
+
+export function codexThreadPreviewForDisplay(
+  name: string | null | undefined,
+  updatedAt: number,
+  options: {
+    preferRecentIdle?: boolean;
+  } = {}
+): string {
+  const preview = firstLine(name) ?? "Codex CLI session";
+  if (preview === "Codex CLI session") {
+    return preview;
+  }
+
+  switch (statusForUpdatedAt(updatedAt, options)) {
+  case "running":
+    return "Waiting for output...";
+  case "idle":
+    return "No activity yet.";
+  default:
+    return preview;
+  }
+}
+
+function threadName(row: CodexThreadRow): string | null {
+  return preferredCodexThreadName(row.title, row.first_user_message);
+}
+
+function threadPreview(row: CodexThreadRow, updatedAt: number): string {
+  return codexThreadPreviewForDisplay(threadName(row), updatedAt, {
+    preferRecentIdle: true,
+  });
 }
 
 function enrichPreview(row: CodexThreadRow, updatedAt: number): string {
-  const basePreview = threadPreview(row);
+  const basePreview = threadPreview(row, updatedAt);
   if (!row.cwd) {
     return basePreview;
   }
@@ -104,8 +169,19 @@ function normalizeUpdatedAt(value: number | undefined): number {
   return value > 1_000_000_000_000 ? value : value * 1000;
 }
 
-function statusForUpdatedAt(updatedAt: number): string {
+function statusForUpdatedAt(
+  updatedAt: number,
+  options: {
+    preferRecentIdle?: boolean;
+  } = {}
+): string {
   const ageMS = Math.max(0, Date.now() - updatedAt);
+  if (options.preferRecentIdle) {
+    if (ageMS < 7 * 24 * 60 * 60 * 1000) {
+      return "idle";
+    }
+    return "unknown";
+  }
   if (ageMS < 15 * 60 * 1000) {
     return "running";
   }
@@ -169,11 +245,42 @@ export async function readCodexThreadLocalTurns(threadId: string): Promise<JSONV
   }
 
   try {
-    return parseCodexRolloutTurns(readFileSync(rolloutPath, "utf8"), threadId);
+    return parseCodexRolloutTurns(readCodexRolloutTailText(rolloutPath), threadId);
   } catch (error) {
     console.warn(`[bridge] failed to read local Codex rollout ${rolloutPath}: ${errorMessage(error)}`);
     return [];
   }
+}
+
+export function readCodexRolloutTailText(
+  rolloutPath: string,
+  maxBytes: number = LOCAL_ROLLOUT_TAIL_READ_BYTES
+): string {
+  const size = statSync(rolloutPath).size;
+  if (size <= maxBytes) {
+    return readFileSync(rolloutPath, "utf8");
+  }
+
+  const byteCount = Math.min(size, maxBytes);
+  const start = size - byteCount;
+  const buffer = Buffer.allocUnsafe(byteCount);
+  const fd = openSync(rolloutPath, "r");
+  try {
+    readSync(fd, buffer, 0, byteCount, start);
+  } finally {
+    closeSync(fd);
+  }
+
+  const text = buffer.toString("utf8");
+  const firstNewline = text.search(/\r?\n/);
+  if (firstNewline === -1) {
+    return text;
+  }
+
+  const newlineWidth = text[firstNewline] === "\r" && text[firstNewline + 1] === "\n"
+    ? 2
+    : 1;
+  return text.slice(firstNewline + newlineWidth);
 }
 
 export async function resolveCodexThreadRolloutPath(threadId: string): Promise<string | null> {
@@ -290,15 +397,17 @@ function resolveCodexRolloutPath(
   }
 }
 
-function parseCodexRolloutTurns(content: string, threadId: string): JSONValue[] {
-  const turns = new Map<string, { id: string; status: string; items: JSONValue[] }>();
+export function parseCodexRolloutTurns(content: string, threadId: string): JSONValue[] {
+  const turns = new Map<string, { id: string; status: string; items: JSONValue[]; lastTouchedIndex: number }>();
   let currentTurnId = `local-rollout-${threadId}`;
 
-  const getTurn = (turnId: string) => {
+  const getTurn = (turnId: string, lastTouchedIndex: number) => {
     let turn = turns.get(turnId);
     if (!turn) {
-      turn = { id: turnId, status: "completed", items: [] };
+      turn = { id: turnId, status: "completed", items: [], lastTouchedIndex };
       turns.set(turnId, turn);
+    } else {
+      turn.lastTouchedIndex = Math.max(turn.lastTouchedIndex, lastTouchedIndex);
     }
     return turn;
   };
@@ -318,25 +427,26 @@ function parseCodexRolloutTurns(content: string, threadId: string): JSONValue[] 
 
     if (record.type === "event_msg" && payloadType === "task_started") {
       currentTurnId = stringValue(payload.turn_id) ?? currentTurnId;
-      getTurn(currentTurnId).status = "running";
+      getTurn(currentTurnId, index).status = "running";
       continue;
     }
 
     const turnId = stringValue(payload.turn_id) ?? currentTurnId;
     if (record.type === "event_msg" && payloadType === "task_complete") {
-      getTurn(turnId).status = "completed";
+      getTurn(turnId, index).status = "completed";
       currentTurnId = `local-rollout-${threadId}`;
       continue;
     }
 
     const item = localRolloutItem(record.type, payloadType, payload, index + 1);
     if (item) {
-      getTurn(turnId).items.push(item);
+      getTurn(turnId, index).items.push(item);
     }
   }
 
   return Array.from(turns.values())
     .filter((turn) => turn.items.length > 0)
+    .sort((left, right) => right.lastTouchedIndex - left.lastTouchedIndex)
     .map((turn) => ({
       id: turn.id,
       status: turn.status,
@@ -356,7 +466,7 @@ function localRolloutItem(
 
   switch (payloadType) {
     case "user_message": {
-      const text = boundedText(stringValue(payload.message));
+      const text = boundedHeadText(stringValue(payload.message));
       return text
         ? {
             id: `local-user-${index}`,
@@ -366,7 +476,7 @@ function localRolloutItem(
         : null;
     }
     case "agent_message": {
-      const text = boundedText(stringValue(payload.message));
+      const text = boundedTailText(stringValue(payload.message));
       return text
         ? {
             id: `local-agent-${index}`,
@@ -385,9 +495,9 @@ function localRolloutItem(
         cwd: stringValue(payload.cwd) ?? null,
         exitCode: numberValue(payload.exit_code),
         status: stringValue(payload.status) ?? null,
-        aggregatedOutput: boundedText(stringValue(payload.aggregated_output)),
-        stdout: boundedText(stringValue(payload.stdout)),
-        stderr: boundedText(stringValue(payload.stderr)),
+        aggregatedOutput: boundedTailText(stringValue(payload.aggregated_output)),
+        stdout: boundedTailText(stringValue(payload.stdout)),
+        stderr: boundedTailText(stringValue(payload.stderr)),
       };
     }
     case "patch_apply_end": {
@@ -398,8 +508,27 @@ function localRolloutItem(
             type: "fileChange",
             status: stringValue(payload.status) ?? null,
             changes,
-          }
+        }
         : null;
+    }
+    case "view_image_tool_call": {
+      const imagePath = boundedHeadText(stringValue(payload.path));
+      return {
+        id: `local-view-image-${index}`,
+        type: "dynamicToolCall",
+        tool: "Viewed Image",
+        contentItems: imagePath,
+        status: "completed",
+      };
+    }
+    case "mcp_tool_call_end": {
+      return {
+        id: `local-mcp-tool-${index}`,
+        type: "dynamicToolCall",
+        tool: localMCPToolTitle(payload),
+        contentItems: boundedHeadText(readableToolResult(payload.result) ?? readableToolResult(payload.error)),
+        status: payload.error ? "failed" : "completed",
+      };
     }
     default:
       return null;
@@ -422,7 +551,7 @@ function rolloutFileChanges(value: JSONValue | undefined): JSONValue[] {
     result.push({
       path: filePath,
       type: stringValue(changeObject.type) ?? "update",
-      unified_diff: boundedText(stringValue(changeObject.unified_diff)),
+      unified_diff: boundedHeadText(stringValue(changeObject.unified_diff)),
     });
   }
 
@@ -449,6 +578,61 @@ function numberValue(value: JSONValue | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function localMCPToolTitle(payload: { [key: string]: JSONValue }): string {
+  const invocation = objectValue(payload.invocation);
+  const server = stringValue(invocation?.server) ?? "MCP";
+  const tool = stringValue(invocation?.tool) ?? "tool";
+  const argumentsText = compactJSON(invocation?.arguments) ?? "{}";
+  return `Called ${server}.${tool}(${argumentsText})`;
+}
+
+function readableToolResult(value: JSONValue | undefined): string | null {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => readableToolResult(entry))
+      .filter((entry): entry is string => Boolean(entry))
+      .join("\n")
+      .trim() || null;
+  }
+
+  const object = objectValue(value);
+  if (!object) {
+    return null;
+  }
+
+  for (const key of ["text", "message", "stdout", "stderr", "error"]) {
+    const text = stringValue(object[key]);
+    if (text) {
+      return text;
+    }
+  }
+
+  for (const key of ["Ok", "Err", "result", "output", "content"]) {
+    const text = readableToolResult(object[key]);
+    if (text) {
+      return text;
+    }
+  }
+
+  return compactJSON(value);
+}
+
+function compactJSON(value: JSONValue | undefined): string | null {
+  if (value === undefined) {
+    return null;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
 function commandText(value: JSONValue | undefined): string | null {
   if (typeof value === "string") {
     return value;
@@ -464,16 +648,28 @@ function commandText(value: JSONValue | undefined): string | null {
   return null;
 }
 
-function boundedText(value: string | null): string | null {
+function boundedHeadText(value: string | null, maxLength = MAX_LOCAL_ROLLOUT_TEXT_LENGTH): string | null {
   if (!value) {
     return null;
   }
 
-  if (value.length <= MAX_LOCAL_ROLLOUT_TEXT_LENGTH) {
+  if (value.length <= maxLength) {
     return value;
   }
 
-  return `${value.slice(0, MAX_LOCAL_ROLLOUT_TEXT_LENGTH).trimEnd()}\n… truncated from local Codex rollout …`;
+  return value.slice(0, maxLength).trimEnd();
+}
+
+function boundedTailText(value: string | null, maxLength = MAX_LOCAL_ROLLOUT_STREAM_TEXT_LENGTH): string | null {
+  if (!value) {
+    return null;
+  }
+
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return value.slice(-maxLength).trimStart();
 }
 
 function errorMessage(error: unknown): string {
@@ -543,7 +739,9 @@ function rowToSummary(row: CodexThreadRow): ThreadSummary | null {
     name: threadName(row),
     preview: enrichPreview(row, updatedAt),
     cwd: row.cwd,
-    status: statusForUpdatedAt(updatedAt),
+    status: statusForUpdatedAt(updatedAt, {
+      preferRecentIdle: true,
+    }),
     updatedAt,
     sourceKind: row.source ?? "cli",
     launchSource: exactLaunch ? HELM_RUNTIME_LAUNCH_SOURCE : null,

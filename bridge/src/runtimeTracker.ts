@@ -3,7 +3,7 @@ import type { PendingApproval, RuntimeActivityEvent, RuntimePhase, RuntimeThread
 const MAX_EVENTS_PER_THREAD = 20;
 const MAX_RUNTIME_DETAIL_CHARS = 3000;
 const MAX_APPROVAL_DETAIL_CHARS = 3000;
-const DETAIL_TRUNCATION_MARKER = "\n...[truncated]...\n";
+const STALE_RUNNING_EVENT_GRACE_MS = 2 * 60 * 1000;
 
 type EventInput = Omit<RuntimeActivityEvent, "id" | "createdAt"> & {
   createdAt?: number;
@@ -13,13 +13,15 @@ export class RuntimeTracker {
   private readonly threads = new Map<string, RuntimeThreadState>();
 
   list(): RuntimeThreadState[] {
-    return Array.from(this.threads.values())
+    return Array.from(this.threads.keys())
+      .map((threadId) => this.reconciledState(threadId))
+      .filter((state): state is RuntimeThreadState => state !== null)
       .map((state) => this.sanitizeThreadState(state))
       .sort((a, b) => b.lastUpdatedAt - a.lastUpdatedAt);
   }
 
   get(threadId: string): RuntimeThreadState | null {
-    const state = this.threads.get(threadId);
+    const state = this.reconciledState(threadId);
     return state ? this.sanitizeThreadState(state) : null;
   }
 
@@ -174,6 +176,42 @@ export class RuntimeTracker {
     return fresh;
   }
 
+  private reconciledState(threadId: string): RuntimeThreadState | null {
+    const state = this.threads.get(threadId);
+    if (!state) {
+      return null;
+    }
+
+    const reconciled = this.reconcileStaleRunningPhase(state);
+    if (reconciled !== state) {
+      this.threads.set(threadId, reconciled);
+    }
+    return reconciled;
+  }
+
+  private reconcileStaleRunningPhase(state: RuntimeThreadState): RuntimeThreadState {
+    if (state.phase !== "running") {
+      return state;
+    }
+
+    const hasCurrentTurn = typeof state.currentTurnId === "string" && state.currentTurnId.trim().length > 0;
+    if (hasCurrentTurn || state.pendingApprovals.length > 0) {
+      return state;
+    }
+
+    const hasFreshRecentEvent =
+      state.recentEvents.length > 0
+      && Date.now() - state.lastUpdatedAt <= STALE_RUNNING_EVENT_GRACE_MS;
+    if (hasFreshRecentEvent) {
+      return state;
+    }
+
+    return {
+      ...state,
+      phase: "idle",
+    };
+  }
+
   private sanitizeThreadState(state: RuntimeThreadState): RuntimeThreadState {
     return {
       ...state,
@@ -202,14 +240,6 @@ export class RuntimeTracker {
       return detail;
     }
 
-    const markerLength = DETAIL_TRUNCATION_MARKER.length;
-    if (maxChars <= markerLength + 2) {
-      return `${detail.slice(0, maxChars)}${DETAIL_TRUNCATION_MARKER}`;
-    }
-
-    const contentBudget = maxChars - markerLength;
-    const headChars = Math.max(1, Math.floor(contentBudget * 0.7));
-    const tailChars = Math.max(1, contentBudget - headChars);
-    return `${detail.slice(0, headChars)}${DETAIL_TRUNCATION_MARKER}${detail.slice(-tailChars)}`;
+    return detail.slice(0, maxChars);
   }
 }

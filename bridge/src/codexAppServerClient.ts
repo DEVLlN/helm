@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import EventEmitter from "node:events";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +10,7 @@ import WebSocket, { type RawData } from "ws";
 import {
   discoverCodexThread,
   discoverCodexThreads,
+  preferredCodexThreadName,
   readCodexThreadLocalTurns,
   resolveCodexThreadRolloutPath,
 } from "./codexThreadDiscovery.js";
@@ -137,8 +138,19 @@ function normalizeUpdatedAt(value: number | undefined): number {
   return value > 1_000_000_000_000 ? value : value * 1000;
 }
 
-function inferredStatusForUpdatedAt(updatedAt: number): string {
+function inferredStatusForUpdatedAt(
+  updatedAt: number,
+  options: {
+    preferRecentIdle?: boolean;
+  } = {}
+): string {
   const ageMS = Math.max(0, Date.now() - updatedAt);
+  if (options.preferRecentIdle) {
+    if (ageMS < 7 * 24 * 60 * 60 * 1000) {
+      return "idle";
+    }
+    return "unknown";
+  }
   if (ageMS < 15 * 60 * 1000) {
     return "running";
   }
@@ -146,6 +158,60 @@ function inferredStatusForUpdatedAt(updatedAt: number): string {
     return "idle";
   }
   return "unknown";
+}
+
+function normalizedThreadSummaryPreview(
+  preview: string | null | undefined,
+  name: string | null | undefined,
+  status: string,
+  fallbackPreview: string | null | undefined = null
+): string {
+  const trimmedPreview = String(preview ?? "").trim();
+  const trimmedFallback = String(fallbackPreview ?? "").trim();
+  const trimmedName = String(name ?? "").trim();
+  const normalizedStatus = status.trim().toLowerCase();
+
+  const titleEcho = (candidate: string): boolean =>
+    candidate.length > 0
+    && trimmedName.length > 0
+    && candidate === trimmedName;
+
+  const titleEchoShouldYieldPlaceholder = (candidate: string): boolean =>
+    (normalizedStatus === "running" || normalizedStatus === "idle")
+    && titleEcho(candidate);
+
+  if (trimmedPreview && !titleEchoShouldYieldPlaceholder(trimmedPreview)) {
+    return trimmedPreview;
+  }
+
+  if (trimmedFallback && !titleEchoShouldYieldPlaceholder(trimmedFallback)) {
+    return trimmedFallback;
+  }
+
+  if (normalizedStatus === "idle" && (titleEcho(trimmedPreview) || titleEcho(trimmedFallback))) {
+    return "No activity yet.";
+  }
+
+  return normalizedStatus === "running" ? "Waiting for output..." : "";
+}
+
+function titleEchoSummaryShouldPreferIdle(
+  preview: string | null | undefined,
+  name: string | null | undefined,
+  fallbackPreview: string | null | undefined = null
+): boolean {
+  const trimmedPreview = String(preview ?? "").trim();
+  const trimmedFallback = String(fallbackPreview ?? "").trim();
+  const trimmedName = String(name ?? "").trim();
+  if (!trimmedName) {
+    return false;
+  }
+
+  return (
+    (trimmedPreview.length === 0 && trimmedFallback.length === 0) ||
+    trimmedPreview === trimmedName ||
+    trimmedFallback === trimmedName
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -329,35 +395,62 @@ function terminalTailDelta(previousText: string | null, nextText: string): strin
   return nextText;
 }
 
-function currentPromptDraftFromTerminalTail(text: string | null): string | null {
+const CODEX_CLI_PLACEHOLDER_DRAFT_PATTERNS = [
+  /^find\s+and\s+fix\s+a\s+bug\s+in\s+@filename$/i,
+  /^write\s+tests\s+for\s+@filename$/i,
+] as const;
+
+function isCodexCLIPlaceholderDraft(text: string): boolean {
+  const normalized = text
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return CODEX_CLI_PLACEHOLDER_DRAFT_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export function currentPromptDraftFromTerminalTail(text: string | null): string | null {
   if (!text) {
     return null;
   }
 
-  const promptIndex = text.lastIndexOf("›");
-  if (promptIndex === -1) {
-    return null;
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index] ?? "";
+    const promptIndex = line.lastIndexOf("›");
+    if (promptIndex === -1) {
+      continue;
+    }
+
+    const promptPrefix = line.slice(0, promptIndex).replace(/\u00a0/g, " ").trim();
+    if (promptPrefix) {
+      continue;
+    }
+
+    const normalizedPromptLine = line
+      .slice(promptIndex + 1)
+      .replace(/\u00a0/g, " ")
+      .trim();
+    if (!normalizedPromptLine) {
+      continue;
+    }
+
+    const draft = normalizedPromptLine
+      .replace(
+        /\s{2,}(?:gpt-|o\d|claude|codex|Fast\s+(?:on|off)|Context\s+\[|\d+K\s+window|5h\s+\d+%|weekly\s+\d+%).*$/i,
+        ""
+      )
+      .replace(/\s+shift\s+\+.*edit\s+last\s+queued\s+message.*$/i, "")
+      .trim();
+
+    if (!draft || isCodexCLIPlaceholderDraft(draft)) {
+      continue;
+    }
+
+    return draft;
   }
 
-  const promptLine = text
-    .slice(promptIndex + 1)
-    .split(/\r?\n/, 1)[0] ?? "";
-  const normalizedPromptLine = promptLine
-    .replace(/\u00a0/g, " ")
-    .trim();
-  if (!normalizedPromptLine) {
-    return null;
-  }
-
-  const draft = normalizedPromptLine
-    .replace(
-      /\s{2,}(?:gpt-|o\d|claude|codex|Fast\s+(?:on|off)|Context\s+\[|\d+K\s+window|5h\s+\d+%|weekly\s+\d+%).*$/i,
-      ""
-    )
-    .replace(/\s+shift\s+\+.*edit\s+last\s+queued\s+message.*$/i, "")
-    .trim();
-
-  return draft.length > 0 ? draft : null;
+  return null;
 }
 
 function runtimeTailLooksQueueable(tail: RuntimeOutputTail | null): boolean {
@@ -384,6 +477,7 @@ function runtimeTailLooksQueueable(tail: RuntimeOutputTail | null): boolean {
 export class CodexAppServerClient extends EventEmitter {
   private socket: WebSocket | null = null;
   private connectInFlight: Promise<void> | null = null;
+  private initialized = false;
   private nextId = 1;
   private readonly pending = new Map<JSONRPCId, PendingRequest>();
   private readonly managedShellEnsures = new Map<string, Promise<EnsureManagedShellThreadResult>>();
@@ -467,11 +561,13 @@ export class CodexAppServerClient extends EventEmitter {
       if (this.socket === socket) {
         this.socket = null;
       }
+      this.initialized = false;
       this.rejectPendingRequests(new Error("Codex app-server socket closed"));
       this.emit("disconnect");
     });
 
     await this.initialize();
+    this.initialized = true;
   }
 
   private async initialize(): Promise<void> {
@@ -481,7 +577,7 @@ export class CodexAppServerClient extends EventEmitter {
         clientInfo: {
           name: "CodexVoiceRemoteBridge",
           title: null,
-          version: "0.1.3",
+          version: "0.1.0",
         },
         capabilities: {
           experimentalApi: true,
@@ -566,13 +662,16 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   async listThreads(): Promise<ThreadSummary[]> {
-    let remoteThreads: ThreadSummary[] = [];
-    try {
-      remoteThreads = await this.listThreadsFromAppServer();
-    } catch (error) {
-      console.warn(`[bridge] Codex thread/list failed; using local discovery only: ${errorMessage(error)}`);
-    }
     const discoveredThreads = await discoverCodexThreads(50);
+    let remoteThreads: ThreadSummary[] = [];
+    if (this.isReadyForRequests() || discoveredThreads.length === 0) {
+      try {
+      remoteThreads = await this.listThreadsFromAppServer();
+      } catch (error) {
+        console.warn(`[bridge] Codex thread/list failed; using local discovery only: ${errorMessage(error)}`);
+      }
+    }
+
     const merged = new Map<string, ThreadSummary>();
     const replacedThreadIDs = new Set(
       listCodexThreadReplacements("codex").map((record) => record.oldThreadId)
@@ -590,21 +689,47 @@ export class CodexAppServerClient extends EventEmitter {
         continue;
       }
       const discovered = merged.get(thread.id);
-      const updatedAt = normalizeUpdatedAt(thread.updatedAt || discovered?.updatedAt || 0);
-      const remoteStatus = thread.status && thread.status !== "unknown" ? thread.status : null;
-      merged.set(thread.id, {
-        ...thread,
-        name: thread.name ?? discovered?.name ?? null,
-        preview: thread.preview || discovered?.preview || "",
-        cwd: thread.cwd || discovered?.cwd || "",
-        status: remoteStatus ?? discovered?.status ?? inferredStatusForUpdatedAt(updatedAt),
-        updatedAt,
-        sourceKind: thread.sourceKind ?? discovered?.sourceKind ?? null,
-        launchSource: thread.launchSource ?? discovered?.launchSource ?? null,
-      });
+      merged.set(thread.id, this.mergeThreadSummary(thread, discovered ?? null));
     }
 
     return Array.from(merged.values()).sort((lhs, rhs) => rhs.updatedAt - lhs.updatedAt);
+  }
+
+  private isReadyForRequests(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN && this.initialized;
+  }
+
+  private mergeThreadSummary(
+    thread: ThreadSummary,
+    discovered: ThreadSummary | null
+  ): ThreadSummary {
+    const updatedAt = normalizeUpdatedAt(thread.updatedAt || discovered?.updatedAt || 0);
+    const remoteStatus = thread.status && thread.status !== "unknown" ? thread.status : null;
+    const preferredName = preferredCodexThreadName(thread.name, discovered?.name);
+    const status = remoteStatus
+      ?? discovered?.status
+      ?? inferredStatusForUpdatedAt(updatedAt, {
+        preferRecentIdle: titleEchoSummaryShouldPreferIdle(
+          thread.preview,
+          preferredName,
+          discovered?.preview ?? null
+        ),
+      });
+    return {
+      ...thread,
+      name: preferredName,
+      preview: normalizedThreadSummaryPreview(
+        thread.preview,
+        preferredName,
+        status,
+        discovered?.preview ?? null
+      ),
+      cwd: thread.cwd || discovered?.cwd || "",
+      status,
+      updatedAt,
+      sourceKind: thread.sourceKind ?? discovered?.sourceKind ?? null,
+      launchSource: thread.launchSource ?? discovered?.launchSource ?? null,
+    };
   }
 
   private async listThreadsFromAppServer(): Promise<ThreadSummary[]> {
@@ -620,12 +745,25 @@ export class CodexAppServerClient extends EventEmitter {
     return threads.map((thread) => {
       const updatedAt = normalizeUpdatedAt(Number(thread.updatedAt ?? 0));
       const status = String(thread.status ?? "unknown");
+      const name = thread.name ? String(thread.name) : null;
+      const normalizedStatus = status !== "unknown"
+        ? status
+        : inferredStatusForUpdatedAt(updatedAt, {
+          preferRecentIdle: titleEchoSummaryShouldPreferIdle(
+            typeof thread.preview === "string" ? thread.preview : null,
+            name
+          ),
+        });
       return {
         id: String(thread.id ?? ""),
-        name: thread.name ? String(thread.name) : null,
-        preview: String(thread.preview ?? ""),
+        name,
+        preview: normalizedThreadSummaryPreview(
+          typeof thread.preview === "string" ? thread.preview : null,
+          name,
+          normalizedStatus
+        ),
         cwd: String(thread.cwd ?? ""),
-        status: status !== "unknown" ? status : inferredStatusForUpdatedAt(updatedAt),
+        status: normalizedStatus,
         updatedAt,
         sourceKind: thread.sourceKind ? String(thread.sourceKind) : null,
         launchSource: thread.launchSource ? String(thread.launchSource) : null,
@@ -660,6 +798,13 @@ export class CodexAppServerClient extends EventEmitter {
     } = {}
   ): Promise<JSONValue | undefined> {
     const includeTurns = options.includeTurns ?? true;
+    if (includeTurns) {
+      const localFirstFallback = await this.localThreadReadFallback(threadId, true);
+      if (localFirstFallback && this.shouldUseLocalThreadReadBeforeAppServer(localFirstFallback)) {
+        return localFirstFallback;
+      }
+    }
+
     try {
       const result = await this.request("thread/read", {
         threadId,
@@ -676,6 +821,28 @@ export class CodexAppServerClient extends EventEmitter {
       const localFallback = includeTurns
         ? await this.localThreadReadFallback(threadId, true)
         : undefined;
+      const shouldFallback =
+        includeTurns
+        && options.allowTurnlessFallback
+        && this.shouldFallbackToTurnlessThreadRead(error);
+      if (shouldFallback) {
+        try {
+          return await this.request("thread/read", {
+            threadId,
+            includeTurns: false,
+          });
+        } catch (fallbackError) {
+          const localMetadataFallback = await this.localThreadReadFallback(threadId, false);
+          if (localMetadataFallback && this.shouldFallbackToLocalThreadRead(fallbackError)) {
+            console.warn(
+              `[bridge] Codex turnless thread/read failed for ${threadId}; using local metadata fallback: ${errorMessage(fallbackError)}`
+            );
+            return localMetadataFallback;
+          }
+          throw fallbackError;
+        }
+      }
+
       if (
         localFallback
         && this.shouldFallbackToLocalThreadRead(error)
@@ -687,10 +854,6 @@ export class CodexAppServerClient extends EventEmitter {
         return localFallback;
       }
 
-      const shouldFallback =
-        includeTurns
-        && options.allowTurnlessFallback
-        && this.shouldFallbackToTurnlessThreadRead(error);
       if (!shouldFallback) {
         const fallback = localFallback ?? await this.localThreadReadFallback(threadId, includeTurns);
         if (fallback && this.shouldFallbackToLocalThreadRead(error)) {
@@ -701,23 +864,23 @@ export class CodexAppServerClient extends EventEmitter {
         }
         throw error;
       }
-
-      try {
-        return await this.request("thread/read", {
-          threadId,
-          includeTurns: false,
-        });
-      } catch (fallbackError) {
-        const localFallback = await this.localThreadReadFallback(threadId, false);
-        if (localFallback && this.shouldFallbackToLocalThreadRead(fallbackError)) {
-          console.warn(
-            `[bridge] Codex turnless thread/read failed for ${threadId}; using local metadata fallback: ${errorMessage(fallbackError)}`
-          );
-          return localFallback;
-        }
-        throw fallbackError;
-      }
     }
+  }
+
+  private shouldUseLocalThreadReadBeforeAppServer(value: JSONValue | undefined): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return false;
+    }
+
+    const thread = value.thread;
+    if (!thread || typeof thread !== "object" || Array.isArray(thread)) {
+      return false;
+    }
+
+    const sourceKind = typeof thread.sourceKind === "string"
+      ? thread.sourceKind.trim().toLowerCase()
+      : "";
+    return sourceKind === "cli" && this.threadReadHasTurns(value);
   }
 
   private async fullerLocalThreadReadFallback(
@@ -765,6 +928,7 @@ export class CodexAppServerClient extends EventEmitter {
     }
 
     const turns = includeTurns ? await readCodexThreadLocalTurns(threadId) : [];
+    const updatedAt = await this.localThreadReadUpdatedAt(threadId, thread.updatedAt);
     return {
       thread: {
         id: thread.id,
@@ -772,11 +936,28 @@ export class CodexAppServerClient extends EventEmitter {
         preview: thread.preview,
         cwd: thread.cwd,
         status: thread.status,
-        updatedAt: thread.updatedAt,
+        updatedAt,
         sourceKind: thread.sourceKind,
         ...(includeTurns ? { turns } : {}),
       },
     };
+  }
+
+  private async localThreadReadUpdatedAt(
+    threadId: string,
+    fallbackUpdatedAt: number
+  ): Promise<number> {
+    try {
+      const rolloutPath = await resolveCodexThreadRolloutPath(threadId);
+      if (!rolloutPath) {
+        return fallbackUpdatedAt;
+      }
+
+      const rolloutStats = await stat(rolloutPath);
+      return Math.max(fallbackUpdatedAt, rolloutStats.mtimeMs);
+    } catch {
+      return fallbackUpdatedAt;
+    }
   }
 
   private threadReadHasTurns(value: JSONValue): boolean {
@@ -986,25 +1167,29 @@ export class CodexAppServerClient extends EventEmitter {
     let appServerSteerError: Error | null = null;
     let shellRelayError: Error | null = null;
     const hasImageAttachments = Boolean(options.imageAttachments?.length);
+    const shellRelayText = this.textWithImageAttachments(effectiveText, options.imageAttachments ?? []);
     let attemptedShellRelay = false;
     const queueDeliveryRequested = options.deliveryMode === "queue" && !hasImageAttachments;
-    const queueDeliveryThread = queueDeliveryRequested ? await discoverCodexThread(threadId) : null;
-    const queueDeliveryUsesSharedDesktopSurface =
-      queueDeliveryThread ? codexSourceKindUsesSharedDesktopSurface(queueDeliveryThread.sourceKind) : false;
-    const queueDeliverySnapshot = queueDeliveryRequested
+    const steerDeliveryRequested = options.deliveryMode === "steer" && !hasImageAttachments;
+    const activeDeliveryRequested = queueDeliveryRequested || steerDeliveryRequested;
+    const deliveryThread = await this.loadThreadDeliverySummary(threadId);
+    const activeDeliveryThread = activeDeliveryRequested ? deliveryThread : null;
+    const activeDeliveryUsesSharedDesktopSurface =
+      activeDeliveryThread ? codexSourceKindUsesSharedDesktopSurface(activeDeliveryThread.sourceKind) : false;
+    const activeDeliverySnapshot = activeDeliveryRequested
       ? await this.readThreadDeliverySnapshot(threadId, effectiveText)
       : null;
-    const queueDeliveryLaunch = queueDeliveryRequested ? findMatchingLaunchByThreadID("codex", threadId) : null;
-    const queueDeliveryHasRuntimeRelay = isRuntimeRelayAvailable(queueDeliveryLaunch);
-    const queueDeliveryTerminalLooksQueueable =
-      queueDeliveryHasRuntimeRelay && runtimeTailLooksQueueable(readRuntimeOutputTail(queueDeliveryLaunch));
-    const queueDeliveryNeedsRunningTurnSteer =
-      queueDeliverySnapshot?.threadStatus === "running" || queueDeliveryTerminalLooksQueueable;
+    const activeDeliveryLaunch = activeDeliveryRequested ? findMatchingLaunchByThreadID("codex", threadId) : null;
+    const activeDeliveryHasRuntimeRelay = isRuntimeRelayAvailable(activeDeliveryLaunch);
+    const activeDeliveryTerminalLooksQueueable =
+      activeDeliveryHasRuntimeRelay && runtimeTailLooksQueueable(readRuntimeOutputTail(activeDeliveryLaunch));
+    const activeDeliveryNeedsRunningTurnSteer =
+      activeDeliverySnapshot?.threadStatus === "running" || activeDeliveryTerminalLooksQueueable;
 
-    const desktopIpcDeliveryThread = queueDeliveryThread ?? await discoverCodexThread(threadId);
+    const desktopIpcDeliveryThread = deliveryThread;
     const desktopIpcDeliveryBaseline = desktopIpcDeliveryThread
       && codexSourceKindUsesSharedDesktopSurface(desktopIpcDeliveryThread.sourceKind)
-      ? queueDeliverySnapshot
+      ? activeDeliverySnapshot
         ?? await this.readThreadDeliverySnapshot(threadId, effectiveText)
         ?? this.threadDeliverySnapshotFromSummary(desktopIpcDeliveryThread)
       : null;
@@ -1019,6 +1204,15 @@ export class CodexAppServerClient extends EventEmitter {
             effectiveText,
             options,
             desktopIpcDeliveryThread
+          );
+        }
+        if (steerDeliveryRequested) {
+          return await this.steerTurnViaCodexDesktopIpc(
+            threadId,
+            effectiveText,
+            options,
+            desktopIpcDeliveryThread,
+            desktopIpcDeliveryBaseline
           );
         }
         if (options.deliveryMode === "interrupt") {
@@ -1045,9 +1239,9 @@ export class CodexAppServerClient extends EventEmitter {
       await this.interruptRunningThreadBeforeSend(threadId, effectiveText);
     }
 
-    if (queueDeliveryNeedsRunningTurnSteer && queueDeliverySnapshot && !queueDeliveryHasRuntimeRelay) {
+    if (activeDeliveryNeedsRunningTurnSteer && activeDeliverySnapshot && !activeDeliveryHasRuntimeRelay) {
       try {
-        const steered = await this.startTurnViaAppServerSteer(threadId, effectiveText, queueDeliverySnapshot, {
+        const steered = await this.startTurnViaAppServerSteer(threadId, effectiveText, activeDeliverySnapshot, {
           swallowErrors: false,
         });
         if (steered) {
@@ -1058,8 +1252,8 @@ export class CodexAppServerClient extends EventEmitter {
       }
     }
 
-    if (queueDeliveryRequested) {
-      const thread = queueDeliveryThread;
+    if (activeDeliveryRequested) {
+      const thread = activeDeliveryThread;
       const isCLIThread = thread?.sourceKind?.trim().toLowerCase() === "cli";
       if (isCLIThread && !findMatchingLaunchByThreadID("codex", threadId)) {
         const ensured = await this.ensureManagedShellThread(threadId, {
@@ -1074,10 +1268,10 @@ export class CodexAppServerClient extends EventEmitter {
     const preferCLIResumeFallback = await this.shouldPreferCLIResumeFallback(threadId);
     const preferShellRelayFirst = await this.shouldPreferShellRelayFirst(threadId);
 
-    if (preferShellRelayFirst && !hasImageAttachments) {
+    if (preferShellRelayFirst) {
       attemptedShellRelay = true;
       try {
-        const shellRelayResult = await this.startTurnViaVerifiedShellRelay(threadId, effectiveText, options);
+        const shellRelayResult = await this.startTurnViaVerifiedShellRelay(threadId, shellRelayText, options);
         if (shellRelayResult) {
           return shellRelayResult;
         }
@@ -1088,7 +1282,7 @@ export class CodexAppServerClient extends EventEmitter {
       throw shellRelayError ?? new Error(`shell relay is required for attached Codex CLI thread ${threadId}`);
     }
 
-    if (queueDeliveryNeedsRunningTurnSteer && !queueDeliveryUsesSharedDesktopSurface) {
+    if (activeDeliveryNeedsRunningTurnSteer && !activeDeliveryUsesSharedDesktopSurface) {
       if (!attemptedShellRelay) {
         attemptedShellRelay = true;
         try {
@@ -1101,7 +1295,7 @@ export class CodexAppServerClient extends EventEmitter {
         }
       }
 
-      throw new Error(this.queueDeliveryFailureMessage(threadId, appServerSteerError, shellRelayError));
+      throw new Error(this.activeDeliveryFailureMessage(threadId, options.deliveryMode, appServerSteerError, shellRelayError));
     }
 
     if (await this.shouldStartViaAppServer(threadId)) {
@@ -1564,10 +1758,32 @@ export class CodexAppServerClient extends EventEmitter {
     return `${trimmed}\n\n${attachmentBlock}`;
   }
 
+  private textWithImageAttachments(text: string, imageAttachments: StartTurnImageAttachment[]): string {
+    const trimmed = text.trim();
+    if (imageAttachments.length === 0) {
+      return trimmed;
+    }
+
+    const attachmentLines = imageAttachments.map((attachment, index) => {
+      const filename = attachment.filename?.trim() || `image-${index + 1}`;
+      return `- ${filename}: ${attachment.path}`;
+    });
+    const attachmentBlock = [
+      "Attached iPhone images were copied to this Mac. Use these local paths when you need to inspect them:",
+      ...attachmentLines,
+    ].join("\n");
+
+    if (!trimmed) {
+      return `Please inspect the attached iPhone image${imageAttachments.length === 1 ? "" : "s"}.\n\n${attachmentBlock}`;
+    }
+
+    return `${trimmed}\n\n${attachmentBlock}`;
+  }
+
   async interruptTurn(threadId: string): Promise<JSONValue | undefined> {
     let shellRelayError: Error | null = null;
 
-    const desktopIpcDeliveryThread = await discoverCodexThread(threadId);
+    const desktopIpcDeliveryThread = await this.loadThreadDeliverySummary(threadId);
     if (
       desktopIpcDeliveryThread
       && codexSourceKindUsesSharedDesktopSurface(desktopIpcDeliveryThread.sourceKind)
@@ -1684,12 +1900,23 @@ export class CodexAppServerClient extends EventEmitter {
     return {
       id: result.thread.id,
       name,
-      preview: name ?? "Codex CLI session",
+      preview: normalizedThreadSummaryPreview(
+        null,
+        name,
+        typeof result.thread.status === "string" && result.thread.status.length > 0
+          ? result.thread.status
+          : inferredStatusForUpdatedAt(updatedAt, {
+            preferRecentIdle: true,
+          }),
+        name ?? "Codex CLI session"
+      ),
       cwd: typeof result.thread.cwd === "string" ? result.thread.cwd : "",
       status:
         typeof result.thread.status === "string" && result.thread.status.length > 0
           ? result.thread.status
-          : inferredStatusForUpdatedAt(updatedAt),
+          : inferredStatusForUpdatedAt(updatedAt, {
+            preferRecentIdle: true,
+          }),
       updatedAt,
       sourceKind: null,
       launchSource: exactLaunch ? HELM_RUNTIME_LAUNCH_SOURCE : null,
@@ -1698,6 +1925,29 @@ export class CodexAppServerClient extends EventEmitter {
       backendKind: "codex",
       controller: null,
     };
+  }
+
+  private async loadThreadDeliverySummary(threadId: string): Promise<ThreadSummary | null> {
+    const discovered = await discoverCodexThread(threadId);
+
+    try {
+      const listed = (await this.listThreadsFromAppServer()).find((thread) => thread.id === threadId) ?? null;
+      if (listed) {
+        return this.mergeThreadSummary(listed, discovered);
+      }
+    } catch (error) {
+      if (!discovered) {
+        console.warn(
+          `[bridge] Codex thread/list failed while resolving delivery for ${threadId}: ${errorMessage(error)}`
+        );
+      }
+    }
+
+    if (discovered) {
+      return discovered;
+    }
+
+    return await this.loadThreadSummary(threadId);
   }
 
   private async launchManagedShellResume(
@@ -1959,7 +2209,7 @@ export class CodexAppServerClient extends EventEmitter {
     };
     const submitAsQueuedFollowUp =
       options.deliveryMode === "queue" ||
-      (options.deliveryMode !== "interrupt" &&
+      (!options.deliveryMode &&
         (baseline.threadStatus === "running" || runtimeTailLooksQueueable(baselineTail)));
     const promptDraftToRestore = submitAsQueuedFollowUp
       ? currentPromptDraftFromTerminalTail(baselineTailText)
@@ -1996,7 +2246,15 @@ export class CodexAppServerClient extends EventEmitter {
           SHELL_RELAY_QUEUE_ACCEPT_TIMEOUT_MS
         );
       }
-      if (!queued) {
+      const materialized = queued
+        ? false
+        : await this.waitForThreadDelivery(
+          threadId,
+          text,
+          baseline,
+          SHELL_RELAY_QUEUE_ACCEPT_TIMEOUT_MS
+        );
+      if (!queued && !materialized) {
         if (promptDraftToRestore) {
           await this.restoreShellRelayDraft(launch, promptDraftToRestore, { clearPromptFirst: true });
         }
@@ -2011,7 +2269,7 @@ export class CodexAppServerClient extends EventEmitter {
 
       return {
         ok: true,
-        mode: "shellRelayQueued",
+        mode: materialized ? "shellRelayQueuedMaterialized" : "shellRelayQueued",
         threadId,
       };
     }
@@ -2134,17 +2392,19 @@ export class CodexAppServerClient extends EventEmitter {
     };
   }
 
-  private queueDeliveryFailureMessage(
+  private activeDeliveryFailureMessage(
     threadId: string,
+    deliveryMode: StartTurnOptions["deliveryMode"],
     appServerSteerError: Error | null,
     shellRelayError: Error | null
   ): string {
+    const label = deliveryMode === "steer" ? "steer" : "queued";
     const reasons = [
       appServerSteerError ? `app-server steer failed: ${appServerSteerError.message}` : null,
-      shellRelayError ? `shell relay queue failed: ${shellRelayError.message}` : null,
+      shellRelayError ? `shell relay ${label} failed: ${shellRelayError.message}` : null,
     ].filter((reason): reason is string => Boolean(reason));
     const suffix = reasons.length > 0 ? ` (${reasons.join("; ")})` : "";
-    return `Codex thread ${threadId} is running; queued delivery could not be confirmed, so the message was not sent${suffix}`;
+    return `Codex thread ${threadId} is running; ${label} delivery could not be confirmed, so the message was not sent${suffix}`;
   }
 
   private codexDesktopIpcDeliveryFailureMessage(threadId: string, error: Error): string {
@@ -2262,9 +2522,10 @@ export class CodexAppServerClient extends EventEmitter {
   private async waitForThreadDelivery(
     threadId: string,
     text: string,
-    baseline: ThreadDeliverySnapshot
+    baseline: ThreadDeliverySnapshot,
+    timeoutMs = SHELL_RELAY_DELIVERY_TIMEOUT_MS
   ): Promise<boolean> {
-    const deadline = Date.now() + SHELL_RELAY_DELIVERY_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
       const snapshot = await this.readThreadDeliverySnapshot(threadId, text);

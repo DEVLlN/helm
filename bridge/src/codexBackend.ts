@@ -1,11 +1,11 @@
 import { AgentBackend, type StartThreadInput } from "./agentBackend.js";
-import { CodexAppServerClient } from "./codexAppServerClient.js";
+import { createDefaultCodexTransport, type CodexTransport } from "./codexTransport.js";
 import type { JSONRPCId, JSONValue, StartTurnOptions, ThreadSummary } from "./types.js";
 
 export class CodexBackend extends AgentBackend {
-  private readonly client: CodexAppServerClient;
+  private readonly transport: CodexTransport;
 
-  constructor(endpoint: string) {
+  constructor(endpoint: string, transport: CodexTransport = createDefaultCodexTransport(endpoint)) {
     super({
       id: "codex",
       label: "Codex",
@@ -38,21 +38,21 @@ export class CodexBackend extends AgentBackend {
       },
     });
 
-    this.client = new CodexAppServerClient(endpoint);
-    this.client.on("event", (event) => {
+    this.transport = transport;
+    this.transport.on("event", (event) => {
       this.emitConversationEvent(event);
     });
-    this.client.on("serverRequest", (request) => {
+    this.transport.on("serverRequest", (request) => {
       this.emitServerRequest(request);
     });
   }
 
   async connect(): Promise<void> {
-    await this.client.connect();
+    await this.transport.connect();
   }
 
   async listThreads(): Promise<ThreadSummary[]> {
-    const threads = await this.client.listThreads();
+    const threads = await this.transport.listThreads();
     return threads.map((thread) => ({
       ...thread,
       backendId: this.summary.id,
@@ -63,9 +63,9 @@ export class CodexBackend extends AgentBackend {
 
   async startThread(input: StartThreadInput = {}): Promise<JSONValue | undefined> {
     if (input.launchMode === "managedShell") {
-      return await this.client.startManagedShellThread(input);
+      return await this.transport.startManagedShellThread(input);
     }
-    return await this.client.startThread(input);
+    return await this.transport.startThread(input);
   }
 
   async bootstrapManagedShellThread(input: StartThreadInput = {}): Promise<{
@@ -73,7 +73,7 @@ export class CodexBackend extends AgentBackend {
     cwd: string;
     mode: string;
   }> {
-    return await this.client.bootstrapManagedShellThread(input);
+    return await this.transport.bootstrapManagedShellThread(input);
   }
 
   async ensureManagedShellThread(
@@ -89,36 +89,40 @@ export class CodexBackend extends AgentBackend {
     launched: boolean;
     cwd: string;
   }> {
-    return await this.client.ensureManagedShellThread(threadId, options);
+    return await this.transport.ensureManagedShellThread(threadId, options);
   }
 
   async readThread(threadId: string): Promise<JSONValue | undefined> {
-    return await this.client.readThread(threadId, {
+    return await this.transport.readThread(threadId, {
       allowTurnlessFallback: true,
     });
   }
 
-  async startTurn(threadId: string, text: string, options: StartTurnOptions = {}): Promise<JSONValue | undefined> {
-    return await this.client.startTurn(threadId, text, options);
+  async startTurn(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions = {}
+  ): Promise<JSONValue | undefined> {
+    return await this.transport.startTurn(threadId, text, options);
   }
 
   async interruptTurn(threadId: string): Promise<JSONValue | undefined> {
-    return await this.client.interruptTurn(threadId);
+    return await this.transport.interruptTurn(threadId);
   }
 
   async sendInput(threadId: string, input: string): Promise<JSONValue | undefined> {
-    return await this.client.sendInput(threadId, input);
+    return await this.transport.sendInput(threadId, input);
   }
 
   async renameThread(threadId: string, name: string): Promise<JSONValue | undefined> {
-    return await this.client.renameThread(threadId, name);
+    return await this.transport.renameThread(threadId, name);
   }
 
   async archiveThread(threadId: string): Promise<void> {
-    await this.client.archiveThread(threadId);
+    await this.transport.archiveThread(threadId);
   }
 
   respond(id: JSONRPCId, result: JSONValue): void {
-    this.client.respond(id, result);
+    this.transport.respond(id, result);
   }
 }
