@@ -1,0 +1,106 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify tag matches package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          export ROOT_VERSION="$(node -p "require('./package.json').version")"
+          export BRIDGE_VERSION="$(node -p "require('./bridge/package.json').version")"
+          test "$RELEASE_VERSION" = "$ROOT_VERSION"
+          test "$RELEASE_VERSION" = "$BRIDGE_VERSION"
+
+      - name: Install bridge dependencies
+        run: npm ci --prefix bridge
+
+      - name: Run bridge tests
+        run: npm --prefix bridge test
+
+      - name: Typecheck bridge
+        run: npm --prefix bridge run check
+
+      - name: Build bridge
+        run: npm --prefix bridge run build
+
+      - name: Validate npm package contents
+        run: npm pack --dry-run
+
+  publish-npm:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish package
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  update-homebrew:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Render formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_REPOSITORY_SLUG: ${{ github.repository }}
+        run: |
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          export TARBALL_URL="https://codeload.github.com/${GITHUB_REPOSITORY_SLUG}/tar.gz/refs/tags/${RELEASE_TAG}"
+          export SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
+          node scripts/render-homebrew-formula.mjs --version "$RELEASE_VERSION" --sha256 "$SHA256" > /tmp/helm.rb
+
+      - name: Update tap repository
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/DEVLlN/homebrew-helm.git" /tmp/homebrew-helm
+          cp /tmp/helm.rb /tmp/homebrew-helm/Formula/helm.rb
+          cd /tmp/homebrew-helm
+          if git diff --quiet -- Formula/helm.rb; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/helm.rb
+          git commit -m "Update Helm to ${RELEASE_TAG}"
+          git push origin HEAD:main

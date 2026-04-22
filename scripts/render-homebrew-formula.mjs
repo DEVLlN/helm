@@ -15,7 +15,7 @@ Render the Homebrew formula for the homebrew-helm tap.
 Defaults:
   version  ${packageJSON.version}
   owner    DEVLlN
-  repo     helm-dev
+  repo     helm
 
 Example:
   node scripts/render-homebrew-formula.mjs --version ${packageJSON.version} --sha256 <tarball-sha256>
@@ -29,7 +29,7 @@ Install path after publishing:
 let version = packageJSON.version;
 let sha256 = "REPLACE_WITH_RELEASE_TARBALL_SHA256";
 let owner = "DEVLlN";
-let repo = "helm-dev";
+let repo = "helm";
 let sourceURL = "";
 
 const args = process.argv.slice(2);
@@ -68,7 +68,7 @@ if (!version || !owner || !repo || !sha256) {
   process.exit(2);
 }
 
-const tarballURL = sourceURL || `https://github.com/${owner}/${repo}/archive/refs/tags/v${version}.tar.gz`;
+const tarballURL = sourceURL || `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/v${version}`;
 
 function renderHomebrewLicense(rawLicense) {
   if (typeof rawLicense !== "string" || rawLicense.trim() === "" || rawLicense === "UNLICENSED") {
