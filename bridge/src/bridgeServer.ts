@@ -1747,7 +1747,7 @@ export class BridgeServer {
   private async listThreadsForResponse(): Promise<ThreadSummary[]> {
     const refresh = this.refreshThreadListCache();
     const cached = this.threadListCache
-      ? this.withControllerMetadata(this.threadListCache.threads)
+      ? this.withControllerMetadata(this.overlayCachedThreadDetails(this.threadListCache.threads))
       : null;
     if (!cached) {
       return await refresh;
@@ -1777,9 +1777,9 @@ export class BridgeServer {
 
     const refresh = (async () => {
       const discoveredThreads = this.withControllerMetadata(await this.listThreadsAcrossBackends());
-      const threads = await this.enrichThreadSummaries(
+      const threads = this.overlayCachedThreadDetails(await this.enrichThreadSummaries(
         this.withControllerMetadata(await this.promoteLiveArchivedCodexThreads(discoveredThreads))
-      );
+      ));
       this.threadListCache = {
         threads,
         updatedAt: Date.now(),
@@ -1831,6 +1831,29 @@ export class BridgeServer {
       updatedAt: Date.now(),
     };
     this.publishThreadListIfChanged(this.threadListCache.threads);
+  }
+
+  private overlayCachedThreadDetails(threads: ThreadSummary[]): ThreadSummary[] {
+    let changed = false;
+    const overlaid = threads.map((thread) => {
+      const detail = this.liveCachedThreadDetail(thread.id);
+      if (!detail) {
+        return thread;
+      }
+
+      const summary = this.threadSummaryFromDetail(detail, thread);
+      if (JSON.stringify(summary) !== JSON.stringify(thread)) {
+        changed = true;
+      }
+      return {
+        ...thread,
+        ...summary,
+      };
+    });
+
+    return changed
+      ? overlaid.sort((lhs, rhs) => rhs.updatedAt - lhs.updatedAt)
+      : threads;
   }
 
   private isLiveTailOnlyThreadDetail(detail: ThreadDetail): boolean {
@@ -2061,10 +2084,13 @@ export class BridgeServer {
         }),
       ]);
       if (detail) {
-        return BridgeServer.shouldPreferFallbackThreadDetail(detail, fallback)
+        const preferred = BridgeServer.shouldPreferFallbackThreadDetail(detail, fallback)
           ? fallback
           : detail;
+        this.publishThreadDetailIfChanged(preferred);
+        return preferred;
       }
+      this.publishThreadDetailIfChanged(fallback);
       return fallback;
     }
 
@@ -3526,7 +3552,7 @@ export class BridgeServer {
       this.threadBackendIds.set(thread.id, thread.backendId);
       return {
         ...thread,
-        controller: this.controllers.get(thread.id),
+        controller: this.controllers.get(thread.id) ?? thread.controller ?? null,
       };
     });
   }

@@ -55,6 +55,7 @@ import type {
   StartTurnFileAttachment,
   StartTurnOptions,
   StartTurnImageAttachment,
+  ThreadController,
   ThreadSummary,
 } from "./types.js";
 
@@ -78,6 +79,8 @@ const INTERRUPT_BEFORE_SEND_TIMEOUT_MS = 6_000;
 const APP_SERVER_MAX_INBOUND_MESSAGE_BYTES = 8 * 1024 * 1024;
 const LOCAL_ROLLOUT_FULLER_TURN_DELTA = 1;
 const LOCAL_ROLLOUT_FULLER_ITEM_DELTA = 8;
+const CODEX_DESKTOP_CONTROLLER_ID = "codex-desktop";
+const CODEX_DESKTOP_CONTROLLER_NAME = "Codex Desktop";
 
 type EnsureManagedShellThreadResult = {
   threadId: string;
@@ -216,6 +219,93 @@ function titleEchoSummaryShouldPreferIdle(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function threadStatusType(value: unknown): string | null {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : null;
+  }
+
+  if (isRecord(value) && typeof value.type === "string") {
+    const normalized = value.type.trim();
+    return normalized.length > 0 ? normalized : null;
+  }
+
+  return null;
+}
+
+function normalizedAppServerThreadStatus(
+  value: unknown,
+  updatedAt: number,
+  options: {
+    preferRecentIdle?: boolean;
+  } = {}
+): string {
+  const rawStatus = threadStatusType(value)?.toLowerCase() ?? "unknown";
+
+  switch (rawStatus) {
+    case "running":
+    case "idle":
+    case "blocked":
+    case "completed":
+    case "unknown":
+      return rawStatus;
+    case "waitingapproval":
+    case "waiting_approval":
+    case "waiting-approval":
+      return "waitingApproval";
+    case "notloaded":
+    case "not_loaded":
+    case "not-loaded":
+      return inferredStatusForUpdatedAt(updatedAt, options);
+    case "loaded":
+      return "running";
+    default:
+      if (rawStatus.includes("waiting") && rawStatus.includes("approval")) {
+        return "waitingApproval";
+      }
+      if (rawStatus.includes("running")) {
+        return "running";
+      }
+      if (rawStatus.includes("idle")) {
+        return "idle";
+      }
+      if (rawStatus.includes("blocked")) {
+        return "blocked";
+      }
+      if (rawStatus.includes("completed")) {
+        return "completed";
+      }
+      return rawStatus;
+  }
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function normalizeWorkspaceRoot(value: string): string {
+  const resolved = path.resolve(value);
+  return resolved.endsWith(path.sep) ? resolved.slice(0, -path.sep.length) : resolved;
+}
+
+function threadMatchesWorkspaceRoot(thread: ThreadSummary, workspaceRoot: string): boolean {
+  const normalizedRoot = normalizeWorkspaceRoot(workspaceRoot);
+  const candidates = [thread.workspacePath, thread.cwd]
+    .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    .map((entry) => normalizeWorkspaceRoot(entry));
+
+  return candidates.some((candidate) => {
+    return candidate === normalizedRoot || candidate.startsWith(`${normalizedRoot}${path.sep}`);
+  });
 }
 
 function isResponse(message: unknown): message is JSONRPCResponse {
@@ -692,7 +782,8 @@ export class CodexAppServerClient extends EventEmitter {
       merged.set(thread.id, this.mergeThreadSummary(thread, discovered ?? null));
     }
 
-    return Array.from(merged.values()).sort((lhs, rhs) => rhs.updatedAt - lhs.updatedAt);
+    const threads = await this.applyCodexDesktopWorkspaceFocus(Array.from(merged.values()));
+    return threads.sort((lhs, rhs) => rhs.updatedAt - lhs.updatedAt);
   }
 
   private isReadyForRequests(): boolean {
@@ -725,52 +816,126 @@ export class CodexAppServerClient extends EventEmitter {
         discovered?.preview ?? null
       ),
       cwd: thread.cwd || discovered?.cwd || "",
+      workspacePath: thread.workspacePath ?? discovered?.workspacePath ?? null,
       status,
       updatedAt,
       sourceKind: thread.sourceKind ?? discovered?.sourceKind ?? null,
       launchSource: thread.launchSource ?? discovered?.launchSource ?? null,
+      controller: thread.controller ?? discovered?.controller ?? null,
     };
   }
 
   private async listThreadsFromAppServer(): Promise<ThreadSummary[]> {
+    let loadedThreadIDs = new Set<string>();
+    try {
+      loadedThreadIDs = await this.listLoadedThreads();
+    } catch (error) {
+      console.warn(`[bridge] Codex thread/loaded/list failed: ${errorMessage(error)}`);
+    }
+
     const result = await this.request("thread/list", {
       archived: false,
       limit: 25,
       sourceKinds: ["appServer", "cli", "vscode"],
     });
 
-    const root = (result ?? {}) as { threads?: Array<Record<string, JSONValue>> };
-    const threads = root.threads ?? [];
+    const root = (result ?? {}) as {
+      data?: Array<Record<string, JSONValue>>;
+      threads?: Array<Record<string, JSONValue>>;
+    };
+    const threads = Array.isArray(root.data)
+      ? root.data.filter((entry): entry is Record<string, JSONValue> => isRecord(entry))
+      : Array.isArray(root.threads)
+        ? root.threads.filter((entry): entry is Record<string, JSONValue> => isRecord(entry))
+        : [];
 
     return threads.map((thread) => {
       const updatedAt = normalizeUpdatedAt(Number(thread.updatedAt ?? 0));
-      const status = String(thread.status ?? "unknown");
-      const name = thread.name ? String(thread.name) : null;
-      const normalizedStatus = status !== "unknown"
-        ? status
-        : inferredStatusForUpdatedAt(updatedAt, {
-          preferRecentIdle: titleEchoSummaryShouldPreferIdle(
-            typeof thread.preview === "string" ? thread.preview : null,
-            name
-          ),
-        });
+      const rawName = stringValue(thread.name);
+      const name = rawName || stringValue(thread.title);
+      const preview = stringValue(thread.preview);
+      const normalizedStatus = normalizedAppServerThreadStatus(thread.status, updatedAt, {
+        preferRecentIdle: titleEchoSummaryShouldPreferIdle(preview, name),
+      });
+      const threadID = String(thread.id ?? "");
       return {
-        id: String(thread.id ?? ""),
+        id: threadID,
         name,
         preview: normalizedThreadSummaryPreview(
-          typeof thread.preview === "string" ? thread.preview : null,
+          preview,
           name,
           normalizedStatus
         ),
         cwd: String(thread.cwd ?? ""),
         status: normalizedStatus,
         updatedAt,
-        sourceKind: thread.sourceKind ? String(thread.sourceKind) : null,
-        launchSource: thread.launchSource ? String(thread.launchSource) : null,
+        sourceKind: stringValue(thread.sourceKind) ?? stringValue(thread.source),
+        launchSource: stringValue(thread.launchSource),
         backendId: "codex",
         backendLabel: "Codex",
         backendKind: "codex",
-        controller: null,
+        controller: loadedThreadIDs.has(threadID)
+          ? codexDesktopThreadController(Date.now())
+          : null,
+      };
+    });
+  }
+
+  private async applyCodexDesktopWorkspaceFocus(threads: ThreadSummary[]): Promise<ThreadSummary[]> {
+    if (threads.length === 0) {
+      return threads;
+    }
+
+    let activeWorkspaceRoots: string[] = [];
+    try {
+      activeWorkspaceRoots = await this.readCodexDesktopActiveWorkspaceRoots();
+    } catch (error) {
+      console.warn(
+        `[bridge] Failed to read Codex active workspace roots: ${errorMessage(error)}`
+      );
+      return threads;
+    }
+
+    if (activeWorkspaceRoots.length === 0) {
+      return threads;
+    }
+
+    const candidateThreadIDs = new Set<string>();
+    for (const workspaceRoot of activeWorkspaceRoots) {
+      const alreadyControlled = threads.some((thread) => {
+        return thread.controller?.clientId === CODEX_DESKTOP_CONTROLLER_ID
+          && threadMatchesWorkspaceRoot(thread, workspaceRoot);
+      });
+      if (alreadyControlled) {
+        continue;
+      }
+
+      const candidate = threads
+        .filter((thread) => {
+          const sourceKind = (thread.sourceKind ?? "").trim().toLowerCase();
+          return (
+            (sourceKind === "vscode" || sourceKind === "appserver")
+            && threadMatchesWorkspaceRoot(thread, workspaceRoot)
+          );
+        })
+        .sort((lhs, rhs) => rhs.updatedAt - lhs.updatedAt)[0];
+      if (candidate) {
+        candidateThreadIDs.add(candidate.id);
+      }
+    }
+
+    if (candidateThreadIDs.size === 0) {
+      return threads;
+    }
+
+    const now = Date.now();
+    return threads.map((thread) => {
+      if (!candidateThreadIDs.has(thread.id) || thread.controller != null) {
+        return thread;
+      }
+      return {
+        ...thread,
+        controller: codexDesktopThreadController(now),
       };
     });
   }
@@ -1252,7 +1417,7 @@ export class CodexAppServerClient extends EventEmitter {
       }
     }
 
-    if (activeDeliveryRequested) {
+    if (activeDeliveryRequested && activeDeliveryNeedsRunningTurnSteer) {
       const thread = activeDeliveryThread;
       const isCLIThread = thread?.sourceKind?.trim().toLowerCase() === "cli";
       if (isCLIThread && !findMatchingLaunchByThreadID("codex", threadId)) {
@@ -1528,6 +1693,26 @@ export class CodexAppServerClient extends EventEmitter {
         `[bridge] Failed to read Codex queued follow-up state; queueing against an empty state: ${error instanceof Error ? error.message : String(error)}`
       );
       return {};
+    }
+  }
+
+  private async readCodexDesktopActiveWorkspaceRoots(): Promise<string[]> {
+    try {
+      const raw = await readFile(codexGlobalStatePath(), "utf8");
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isRecord(parsed)) {
+        return [];
+      }
+
+      return Array.from(new Set(
+        stringArrayValue(parsed["active-workspace-roots"])
+          .map((entry) => normalizeWorkspaceRoot(entry))
+      ));
+    } catch (error) {
+      if (isRecord(error) && error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
     }
   }
 
@@ -2001,8 +2186,21 @@ export class CodexAppServerClient extends EventEmitter {
       };
 
       const data = Array.isArray(root.data) ? root.data : [];
-      for (const threadId of data) {
-        if (typeof threadId === "string" && threadId.length > 0) {
+      for (const entry of data) {
+        if (typeof entry === "string" && entry.length > 0) {
+          loaded.add(entry);
+          continue;
+        }
+
+        if (!isRecord(entry)) {
+          continue;
+        }
+
+        const threadId =
+          stringValue(entry.threadId)
+          ?? stringValue(entry.id)
+          ?? stringValue(entry.conversationId);
+        if (threadId) {
           loaded.add(threadId);
         }
       }
@@ -2774,6 +2972,15 @@ function codexSourceKindUsesSharedDesktopSurface(sourceKind: string | null | und
 function codexSourceKindRequiresDesktopIpc(sourceKind: string | null | undefined): boolean {
   const normalized = sourceKind?.trim().toLowerCase() ?? "";
   return normalized === "vscode";
+}
+
+function codexDesktopThreadController(now = Date.now()): ThreadController {
+  return {
+    clientId: CODEX_DESKTOP_CONTROLLER_ID,
+    clientName: CODEX_DESKTOP_CONTROLLER_NAME,
+    claimedAt: now,
+    lastSeenAt: now,
+  };
 }
 
 async function scrubBootstrapThreadMetadata(threadId: string): Promise<void> {

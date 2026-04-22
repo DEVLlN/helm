@@ -6,12 +6,71 @@ import type { JSONValue } from "./types.js";
 
 type CodexClientPrivateHooks = {
   localThreadReadFallback(threadId: string, includeTurns: boolean): Promise<JSONValue | undefined>;
-  listThreadsFromAppServer(): Promise<Array<{ name: string | null; preview: string; status: string | null }>>;
+  applyCodexDesktopWorkspaceFocus(threads: Array<{
+    id: string;
+    cwd: string;
+    workspacePath?: string | null;
+    updatedAt: number;
+    sourceKind: string | null;
+    controller?: {
+      clientId: string;
+      clientName: string;
+      claimedAt: number;
+      lastSeenAt: number;
+    } | null;
+  }>): Promise<Array<{
+    id: string;
+    cwd: string;
+    workspacePath?: string | null;
+    updatedAt: number;
+    sourceKind: string | null;
+    controller?: {
+      clientId: string;
+      clientName: string;
+      claimedAt: number;
+      lastSeenAt: number;
+    } | null;
+  }>>;
+  listThreadsFromAppServer(): Promise<Array<{
+    id?: string;
+    cwd?: string;
+    sourceKind?: string | null;
+    updatedAt?: number;
+    name: string | null;
+    preview: string;
+    status: string | null;
+    controller?: {
+      clientId: string;
+      clientName: string;
+      claimedAt: number;
+      lastSeenAt: number;
+    } | null;
+  }>>;
   mergeThreadSummary(
     thread: { name: string | null; preview?: string | null; updatedAt: number; status: string | null },
     discovered: { name: string | null; preview?: string | null; updatedAt: number; status: string | null } | null
   ): { name: string | null; preview: string; status: string | null };
   request(method: string, params?: JSONValue): Promise<JSONValue | undefined>;
+  readCodexDesktopActiveWorkspaceRoots(): Promise<string[]>;
+  loadThreadDeliverySummary(threadId: string): Promise<{ sourceKind?: string | null; status?: string | null } | null>;
+  readThreadDeliverySnapshot(threadId: string, text: string): Promise<{
+    hasTurnData: boolean;
+    turnCount: number;
+    matchingUserTextCount: number;
+    updatedAt: number;
+    threadStatus: string | null;
+    activeTurnId: string | null;
+  } | null>;
+  ensureManagedShellThread(threadId: string, options?: { launchManagedShell?: boolean; preferVisibleLaunch?: boolean }): Promise<{
+    threadId: string;
+    previousThreadId: string | null;
+    replaced: boolean;
+    launched: boolean;
+    cwd: string;
+  }>;
+  shouldStartViaAppServer(threadId: string): Promise<boolean>;
+  shouldPreferCLIResumeFallback(threadId: string): Promise<boolean>;
+  shouldPreferShellRelayFirst(threadId: string): Promise<boolean>;
 };
 
 test("Codex CLI thread reads use local rollout before app-server", async () => {
@@ -62,6 +121,68 @@ test("Codex CLI thread reads use local rollout before app-server", async () => {
       : null,
     "cli"
   );
+});
+
+test("idle attached CLI turn delivery skips managed shell launch before app-server send", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  let ensureManagedShellCalls = 0;
+  const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "cli",
+    status: "idle",
+  });
+  hooks.readThreadDeliverySnapshot = async () => ({
+    hasTurnData: true,
+    turnCount: 1,
+    matchingUserTextCount: 0,
+    updatedAt: 123_000,
+    threadStatus: "idle",
+    activeTurnId: null,
+  });
+  hooks.ensureManagedShellThread = async () => {
+    ensureManagedShellCalls += 1;
+    throw new Error("managed shell launch should not run for idle attached CLI delivery");
+  };
+  hooks.shouldStartViaAppServer = async () => true;
+  hooks.shouldPreferCLIResumeFallback = async () => false;
+  hooks.shouldPreferShellRelayFirst = async () => false;
+  hooks.request = async (method: string, params?: JSONValue) => {
+    requestCalls.push({ method, params });
+    assert.equal(method, "turn/start");
+    return {
+      ok: true,
+      mode: "steer",
+      threadId: "thread-1",
+    };
+  };
+
+  const result = await client.startTurn("thread-1", "keep parity", {
+    deliveryMode: "steer",
+  });
+
+  assert.equal(ensureManagedShellCalls, 0);
+  assert.deepEqual(requestCalls, [
+    {
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        input: [
+          {
+            type: "text",
+            text: "keep parity",
+            text_elements: [],
+          },
+        ],
+      },
+    },
+  ]);
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "steer",
+    threadId: "thread-1",
+  });
 });
 
 test("Codex CLI prompt draft extraction ignores styled placeholder text", () => {
@@ -215,35 +336,42 @@ test("Codex app-server list rewrites running title-only previews to waiting plac
   const hooks = client as unknown as CodexClientPrivateHooks;
 
   hooks.request = async (method: string) => {
+    if (method === "thread/loaded/list") {
+      return {
+        data: [],
+        nextCursor: null,
+      } as JSONValue;
+    }
     assert.equal(method, "thread/list");
     return {
-      threads: [
+      data: [
         {
           id: "thread-1",
           name: "Test app and fix bugs",
           preview: "Test app and fix bugs",
           cwd: "/tmp/project",
-          status: "running",
+          status: { type: "running" },
           updatedAt: 456_000,
-          sourceKind: "vscode",
+          source: "vscode",
         },
         {
           id: "thread-2",
           name: "Daily bug scan",
           preview: "Daily bug scan",
           cwd: "/tmp/project",
-          status: "idle",
+          status: { type: "idle" },
           updatedAt: 455_000,
-          sourceKind: "vscode",
+          source: "vscode",
         },
       ],
-    };
+    } as JSONValue;
   };
 
   const threads = await hooks.listThreadsFromAppServer();
 
   assert.equal(threads[0]?.preview, "Waiting for output...");
   assert.equal(threads[1]?.preview, "No activity yet.");
+  assert.equal(threads[0]?.sourceKind, "vscode");
 });
 
 test("recent title-only unknown app-server sessions stay idle", async () => {
@@ -251,22 +379,118 @@ test("recent title-only unknown app-server sessions stay idle", async () => {
   const hooks = client as unknown as CodexClientPrivateHooks;
   const now = Date.now();
 
-  hooks.request = async () => ({
-    threads: [
-      {
-        id: "thread-1",
-        name: "Resume Gabagool replay logic",
-        preview: "Resume Gabagool replay logic",
-        cwd: "/tmp/project",
-        status: "unknown",
-        updatedAt: now,
-        sourceKind: "vscode",
-      },
-    ],
-  });
+  hooks.request = async (method: string) => {
+    if (method === "thread/loaded/list") {
+      return {
+        data: [],
+        nextCursor: null,
+      } as JSONValue;
+    }
+    return {
+      data: [
+        {
+          id: "thread-1",
+          name: "Resume Gabagool replay logic",
+          preview: "Resume Gabagool replay logic",
+          cwd: "/tmp/project",
+          status: { type: "notLoaded" },
+          updatedAt: now,
+          source: "vscode",
+        },
+      ],
+    } as JSONValue;
+  };
 
   const threads = await hooks.listThreadsFromAppServer();
 
   assert.equal(threads[0]?.status, "idle");
   assert.equal(threads[0]?.preview, "No activity yet.");
+  assert.equal(threads[0]?.sourceKind, "vscode");
+});
+
+test("loaded app-server sessions expose Codex Desktop controller metadata", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const now = Date.now();
+
+  hooks.request = async (method: string) => {
+    switch (method) {
+      case "thread/loaded/list":
+        return {
+          data: [{ id: "thread-1" }],
+          nextCursor: null,
+        } as JSONValue;
+      case "thread/list":
+        return {
+          data: [
+            {
+              id: "thread-1",
+              name: "Resume Gabagool replay logic",
+              preview: "Resume Gabagool replay logic",
+              cwd: "/tmp/project",
+              status: { type: "idle" },
+              updatedAt: now - 3_600_000,
+              source: "vscode",
+            },
+            {
+              id: "thread-2",
+              name: "Update AGENTS.md",
+              preview: "Update AGENTS.md",
+              cwd: "/tmp/project",
+              status: { type: "idle" },
+              updatedAt: now - 3_600_000,
+              source: "vscode",
+            },
+          ],
+        } as JSONValue;
+      default:
+        throw new Error(`unexpected method: ${method}`);
+    }
+  };
+
+  const threads = await hooks.listThreadsFromAppServer();
+
+  assert.equal(threads[0]?.controller?.clientId, "codex-desktop");
+  assert.equal(threads[0]?.controller?.clientName, "Codex Desktop");
+  assert.equal(threads[1]?.controller, null);
+});
+
+test("active Codex workspace falls back to newest desktop thread when loaded list is empty", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+
+  hooks.readCodexDesktopActiveWorkspaceRoots = async () => [
+    "/Users/devlin/GitHub/prediction-markets-bot",
+  ];
+
+  const threads = await hooks.applyCodexDesktopWorkspaceFocus([
+    {
+      id: "thread-1",
+      cwd: "/Users/devlin/GitHub/helm-dev",
+      workspacePath: "/Users/devlin/GitHub/helm-dev",
+      updatedAt: 200,
+      sourceKind: "vscode",
+      controller: null,
+    },
+    {
+      id: "thread-2",
+      cwd: "/Users/devlin/GitHub/prediction-markets-bot",
+      workspacePath: "/Users/devlin/GitHub/prediction-markets-bot",
+      updatedAt: 150,
+      sourceKind: "vscode",
+      controller: null,
+    },
+    {
+      id: "thread-3",
+      cwd: "/Users/devlin/GitHub/prediction-markets-bot",
+      workspacePath: "/Users/devlin/GitHub/prediction-markets-bot",
+      updatedAt: 100,
+      sourceKind: "vscode",
+      controller: null,
+    },
+  ]);
+
+  assert.equal(threads.find((thread) => thread.id === "thread-2")?.controller?.clientId, "codex-desktop");
+  assert.equal(threads.find((thread) => thread.id === "thread-3")?.controller, null);
+  assert.equal(threads.find((thread) => thread.id === "thread-1")?.controller, null);
 });
