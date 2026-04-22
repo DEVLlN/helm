@@ -23,6 +23,7 @@ import {
   codexThreadPreviewForDisplay,
   discoverCodexThread,
   preferredCodexThreadName,
+  readCodexThreadLocalTurns,
   resolveCodexThreadByName,
 } from "./codexThreadDiscovery.js";
 import { HELM_RUNTIME_LAUNCH_SOURCE, isHelmManagedLaunchSource } from "./helmManagedLaunch.js";
@@ -2026,10 +2027,7 @@ export class BridgeServer {
       ? this.threadSummaryFromDetail(cached)
       : this.cachedThreadSummary(threadId)
         ?? await this.discoverLocalCodexThreadSummary(threadId);
-    const placeholder = !cached && summary
-      ? this.placeholderThreadDetailFromSummary(summary, options)
-      : null;
-    const fallback = cached ?? placeholder;
+    const fallbackPromise = this.fallbackThreadDetailForResponse(threadId, summary, options, cached);
     const read = this.readNormalizedThreadDetailCoalesced(
       threadId,
       summary,
@@ -2047,6 +2045,7 @@ export class BridgeServer {
         return null;
       });
 
+    const fallback = await fallbackPromise;
     if (fallback) {
       const freshWaitMS = options.preferFresh
         ? BridgeServer.THREAD_DETAIL_STREAM_RESPONSE_FRESH_WAIT_MS
@@ -2062,12 +2061,54 @@ export class BridgeServer {
         }),
       ]);
       if (detail) {
-        return detail;
+        return BridgeServer.shouldPreferFallbackThreadDetail(detail, fallback)
+          ? fallback
+          : detail;
       }
       return fallback;
     }
 
     return await read;
+  }
+
+  private static shouldPreferFallbackThreadDetail(
+    detail: ThreadDetail,
+    fallback: ThreadDetail
+  ): boolean {
+    return BridgeServer.materialThreadTurnCount(detail) == 0
+      && BridgeServer.materialThreadTurnCount(fallback) > 0;
+  }
+
+  private static materialThreadTurnCount(detail: ThreadDetail): number {
+    return detail.turns.filter((turn) => !turn.id.startsWith("live-tail-")).length;
+  }
+
+  private async fallbackThreadDetailForResponse(
+    threadId: string,
+    summary: ThreadSummary | null,
+    options: {
+      includeLiveRuntimeTail?: boolean;
+    } = {},
+    cached: ThreadDetail | null = null
+  ): Promise<ThreadDetail | null> {
+    if (cached && BridgeServer.materialThreadTurnCount(cached) > 0) {
+      return cached;
+    }
+
+    if (!summary) {
+      return cached;
+    }
+
+    const localFallback = await this.codexLocalThreadDetailFallback(threadId, summary, options);
+    if (localFallback) {
+      return localFallback;
+    }
+
+    if (cached) {
+      return cached;
+    }
+
+    return this.placeholderThreadDetailFromSummary(summary, options);
   }
 
   private isTruthyQueryValue(value: unknown): boolean {
@@ -2147,6 +2188,59 @@ export class BridgeServer {
     return options.includeLiveRuntimeTail
       ? this.withLiveRuntimeTail(placeholder, backend.summary.id)
       : placeholder;
+  }
+
+  private async codexLocalThreadDetailFallback(
+    threadId: string,
+    summary: ThreadSummary,
+    options: {
+      includeLiveRuntimeTail?: boolean;
+    } = {}
+  ): Promise<ThreadDetail | null> {
+    const backend = this.backendForId(summary.backendId);
+    if (backend.summary.id !== "codex") {
+      return null;
+    }
+
+    const localTurns = await this.codexLocalThreadTurns(threadId);
+    if (localTurns.length === 0) {
+      return null;
+    }
+
+    const detail = this.normalizeThreadDetail(
+      {
+        thread: {
+          id: summary.id,
+          name: summary.name,
+          preview: summary.preview,
+          cwd: summary.cwd,
+          status: summary.status,
+          updatedAt: this.normalizeThreadUpdatedAt(summary.updatedAt),
+          sourceKind: summary.sourceKind,
+          launchSource: summary.launchSource ?? null,
+          turns: localTurns,
+        },
+      },
+      backend.summary,
+      summary
+    );
+    if (!detail) {
+      return null;
+    }
+
+    const workspacePath = summary.workspacePath ?? await resolveWorkspacePath(detail.cwd);
+    const detailWithWorkspace = {
+      ...detail,
+      workspacePath: workspacePath || null,
+    };
+
+    return options.includeLiveRuntimeTail
+      ? this.withLiveRuntimeTail(detailWithWorkspace, backend.summary.id)
+      : detailWithWorkspace;
+  }
+
+  private async codexLocalThreadTurns(threadId: string): Promise<JSONValue[]> {
+    return await readCodexThreadLocalTurns(threadId);
   }
 
   private async readNormalizedThreadDetail(

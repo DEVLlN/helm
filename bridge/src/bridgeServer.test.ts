@@ -12,6 +12,20 @@ import type {
 } from "./types.js";
 
 type BridgeServerInternals = {
+  fallbackThreadDetailForResponse(
+    threadId: string,
+    summary: ThreadSummary | null,
+    options?: {
+      includeLiveRuntimeTail?: boolean;
+    }
+  ): Promise<ThreadDetail | null>;
+  readNormalizedThreadDetailForResponse(
+    threadId: string,
+    options?: {
+      includeLiveRuntimeTail?: boolean;
+      preferFresh?: boolean;
+    }
+  ): Promise<ThreadDetail | null>;
   codexComputedThreadName(row: { title?: string | null; first_user_message?: string | null }): string | null;
   compactThreadDetailItem(item: ThreadDetailItem): ThreadDetailItem;
   compactThreadDetailForWebSocket(detail: ThreadDetail): ThreadDetail;
@@ -332,6 +346,156 @@ test("thread list enrichment fetches detail for generic summaries", async () => 
     enriched.find((thread) => thread.id === "thread-2")?.preview,
     "Daily bug scan"
   );
+});
+
+test("thread detail fallback uses local codex turns before an empty placeholder", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const summary: ThreadSummary = {
+    id: "thread-1",
+    name: "Test app and fix bugs",
+    preview: "Waiting for output...",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+
+  server.codexLocalThreadTurns = async () => [
+    {
+      id: "turn-1",
+      status: "completed",
+      items: [
+        {
+          id: "user-1",
+          type: "userMessage",
+          content: {
+            text: "Investigate the stuck waiting placeholder.\n",
+          },
+        },
+      ],
+    },
+  ];
+
+  const detail = await server.fallbackThreadDetailForResponse(summary.id, summary);
+
+  assert.equal(detail?.status, "running");
+  assert.equal(detail?.workspacePath, "/Users/devlin/GitHub/helm-dev");
+  assert.equal(detail?.turns.length, 1);
+  assert.equal(detail?.turns[0]?.items[0]?.title, "User message");
+  assert.equal(
+    detail?.turns[0]?.items[0]?.detail?.trim(),
+    "Investigate the stuck waiting placeholder."
+  );
+});
+
+test("thread detail response prefers local codex turns over an empty live read", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const summary: ThreadSummary = {
+    id: "thread-1",
+    name: "Test app and fix bugs",
+    preview: "Waiting for output...",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+
+  server.liveCachedThreadDetail = () => ({
+    id: "thread-1",
+    name: "Test app and fix bugs",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 122_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {
+      routing: "threadTurns",
+      approvals: "bridgeDecisions",
+      handoff: "sharedThread",
+      voiceInput: "bridgeRealtime",
+      voiceOutput: "bridgeSpeech",
+      supportsCommandFollowups: true,
+      notes: "Command routes into shared Codex threads on the Mac.",
+    },
+    affordances: {
+      canSendTurns: true,
+      canInterrupt: true,
+      canRespondToApprovals: true,
+      canUseRealtimeCommand: true,
+      showsOperationalSnapshot: true,
+      sessionAccess: "sharedThread",
+      notes: "Shared thread bridge session.",
+    },
+    turns: [],
+  } satisfies ThreadDetail);
+  server.cachedThreadSummary = () => summary;
+  server.discoverLocalCodexThreadSummary = async () => summary;
+  server.codexLocalThreadTurns = async () => [
+    {
+      id: "turn-1",
+      status: "completed",
+      items: [
+        {
+          id: "agent-1",
+          type: "agentMessage",
+          text: "Recovered local rollout detail.",
+        },
+      ],
+    },
+  ];
+  server.readNormalizedThreadDetailCoalesced = async () => ({
+    id: "thread-1",
+    name: "Test app and fix bugs",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 124_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {
+      routing: "threadTurns",
+      approvals: "bridgeDecisions",
+      handoff: "sharedThread",
+      voiceInput: "bridgeRealtime",
+      voiceOutput: "bridgeSpeech",
+      supportsCommandFollowups: true,
+      notes: "Command routes into shared Codex threads on the Mac.",
+    },
+    affordances: {
+      canSendTurns: true,
+      canInterrupt: true,
+      canRespondToApprovals: true,
+      canUseRealtimeCommand: true,
+      showsOperationalSnapshot: true,
+      sessionAccess: "sharedThread",
+      notes: "Shared thread bridge session.",
+    },
+    turns: [],
+  } satisfies ThreadDetail);
+
+  const detail = await server.readNormalizedThreadDetailForResponse(summary.id);
+
+  assert.equal(detail?.turns.length, 1);
+  assert.equal(detail?.turns[0]?.items[0]?.detail, "Recovered local rollout detail.");
 });
 
 test("recent empty thread details do not infer running without turns", () => {
