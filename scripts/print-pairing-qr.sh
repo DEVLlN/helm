@@ -4,19 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE_DIR="$ROOT_DIR/bridge"
 AUTO_START=1
-SHOW_LINK=0
 
 usage() {
   cat <<'EOF'
-Usage: helm pair [--no-start] [--show-link]
+Usage: helm pair [--no-start]
 
 Print a QR code that pairs iPhone Helm with this Mac's bridge.
 
 By default, this starts the bridge first if it is not already reachable.
 
 Options:
-  --no-start   Only print a QR if the bridge is already running.
-  --show-link  Also print the raw setup link after the QR.
+  --no-start  Only print a QR if the bridge is already running.
 EOF
 }
 
@@ -24,10 +22,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-start)
       AUTO_START=0
-      shift
-      ;;
-    --show-link)
-      SHOW_LINK=1
       shift
       ;;
     -h|--help)
@@ -188,7 +182,7 @@ for _ in 0..<quietZone {
 SWIFT
 
 echo
-if [[ "$SHOW_LINK" -eq 1 ]]; then
-  echo "Setup link:"
-  echo "$SETUP_URL"
-fi
+echo "Setup link:"
+echo "$SETUP_URL"
+echo
+echo "Helm prefers a non-loopback bridge URL when the bridge advertises one, so a connected Tailscale address is used automatically."

@@ -20,7 +20,7 @@ Usage:
 Commands:
   setup      Install Helm bridge helpers, enable runtime wrapping, configure Tailscale, start the bridge, and print pairing details.
   bridge     Manage the local Helm bridge runtime and pairing helpers.
-  platforms  Detect the local runtimes, shell integration, and Tailscale state that Helm can use.
+  platforms  Detect the local runtimes, shell integration, Tailscale state, and Mac-app build support that Helm can use.
 
 Compatibility aliases:
   helm install  -> helm setup
@@ -31,6 +31,7 @@ Compatibility aliases:
 
 Examples:
   helm setup
+  helm setup --mac-app
   helm setup --skip-tailscale --no-pairing-qr
   helm bridge up
   helm bridge pair --no-start
@@ -45,14 +46,14 @@ function bridgeUsage() {
 Usage:
   helm bridge setup [setup options]
   helm bridge up [--lan]
-  helm bridge pair [--no-start] [--show-link]
+  helm bridge pair [--no-start]
   helm bridge status
   helm bridge down
 
 Bridge commands:
   setup   Run the guided Helm bridge setup flow.
   up      Start the local bridge and Codex app-server helper.
-  pair    Start the bridge if needed, then print the pairing QR.
+  pair    Start the bridge if needed, then print the pairing QR and setup link.
   status  Show bridge health, pairing details, and voice-provider availability.
   down    Stop the local prototype bridge stack.
 `);
@@ -74,17 +75,27 @@ function runScript(script, args) {
 
 function runSetup(args) {
   const passThrough = [];
+  let includeMacApp = false;
 
   for (const arg of args) {
     if (arg === "--bridge" || arg === "--cli" || arg === "--bridge-only" || arg === "--cli-only") {
       continue;
     }
 
-    if (arg === "--mac-app" || arg === "--with-mac-app" || arg === "--all" || arg === "--no-mac-app") {
+    if (arg === "--mac-app" || arg === "--with-mac-app" || arg === "--all") {
+      includeMacApp = true;
       continue;
     }
 
     passThrough.push(arg);
+  }
+
+  const hasMacChoice =
+    includeMacApp ||
+    passThrough.includes("--no-mac-app");
+
+  if (!hasMacChoice) {
+    passThrough.unshift("--no-mac-app");
   }
 
   runScript("install-helm.sh", passThrough);

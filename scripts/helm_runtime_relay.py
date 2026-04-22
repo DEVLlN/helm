@@ -24,7 +24,11 @@ TYPEWRITE_CHAR_DELAY_SECONDS = 0.002
 LIVE_TAIL_MAX_CHARS = 20000
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 OSC_ESCAPE_RE = re.compile(r"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
-CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
+CSI_CURSOR_LEFT_RE = re.compile(r"\x1B\[([0-9]*)D")
+CSI_CURSOR_HORIZONTAL_ABSOLUTE_RE = re.compile(r"\x1B\[[0-9]*G")
+CSI_ERASE_ENTIRE_LINE_RE = re.compile(r"\x1B\[2K")
+INLINE_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+TEXTUAL_BRACKETED_PASTE_RE = re.compile(r"\^\[\[(?:200|201)~")
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,67 +52,26 @@ def sync_window_size(source_fd: int, target_fd: int) -> None:
     fcntl.ioctl(target_fd, termios.TIOCSWINSZ, packed)
 
 
-def compact_fragmented_terminal_text(text: str) -> str:
-    def normalize_fragment_spacing(value: str) -> str:
-        value = re.sub(r" (?=[:;,.!?])", "", value)
-        value = re.sub(r"(?<=[A-Za-z0-9/]) (?=[A-Za-z0-9/])", "", value)
-        value = re.sub(r"(?<=[:;,.!?])(?=[A-Za-z])", " ", value)
-        return value
-
-    lines = text.splitlines()
-    compacted: list[str] = []
-    fragmented = ""
-
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            if fragmented and not fragmented.endswith(" "):
-                fragmented += " "
-            continue
-
-        if len(stripped) == 1:
-            fragmented += stripped
-            continue
-
-        if fragmented:
-            compacted.append(normalize_fragment_spacing(fragmented.strip()))
-            fragmented = ""
-
-        compacted.append(stripped)
-
-    if fragmented:
-        compacted.append(normalize_fragment_spacing(fragmented.strip()))
-
-    return "\n".join(compacted)
-
-
-def sanitize_terminal_text(text: str) -> str:
-    text = OSC_ESCAPE_RE.sub("", text)
-    text = ANSI_ESCAPE_RE.sub("", text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = CONTROL_CHAR_RE.sub("", text)
-    return compact_fragmented_terminal_text(text)
-
-
 class LiveTailBuffer:
     def __init__(self, path: Path, max_chars: int = LIVE_TAIL_MAX_CHARS):
         self.path = path
         self.max_chars = max_chars
-        self.buffer = ""
+        self.lines: list[str] = []
+        self.current_line = ""
 
     def append(self, chunk: bytes) -> None:
-        text = sanitize_terminal_text(chunk.decode("utf-8", errors="replace"))
+        text = self._strip_escape_sequences(chunk.decode("utf-8", errors="replace"))
         if not text:
             return
 
-        self.buffer += text
-        if len(self.buffer) > self.max_chars:
-            self.buffer = self.buffer[-self.max_chars :]
+        self._apply_terminal_text(text)
+        rendered = self._render()
+        if not rendered:
+            return
 
         payload = {
             "updatedAt": int(time.time() * 1000),
-            "text": self.buffer,
+            "text": rendered,
         }
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -119,6 +82,62 @@ class LiveTailBuffer:
             self.path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    def _strip_escape_sequences(self, text: str) -> str:
+        text = OSC_ESCAPE_RE.sub("", text)
+        text = CSI_CURSOR_LEFT_RE.sub(self._cursor_left_replacement, text)
+        text = CSI_CURSOR_HORIZONTAL_ABSOLUTE_RE.sub("\r", text)
+        text = CSI_ERASE_ENTIRE_LINE_RE.sub("\r", text)
+        text = ANSI_ESCAPE_RE.sub("", text)
+        return TEXTUAL_BRACKETED_PASTE_RE.sub("", text)
+
+    def _cursor_left_replacement(self, match: re.Match) -> str:
+        raw_count = match.group(1)
+        try:
+            count = int(raw_count) if raw_count else 1
+        except ValueError:
+            count = 1
+        return "\b" * max(1, min(count, 500))
+
+    def _apply_terminal_text(self, text: str) -> None:
+        for char in text:
+            if char == "\r":
+                self.current_line = ""
+                continue
+            if char == "\n":
+                self._commit_current_line()
+                continue
+            if char == "\b":
+                self.current_line = self.current_line[:-1]
+                continue
+            if char == "\t":
+                self.current_line += "    "
+                continue
+            if INLINE_CONTROL_CHAR_RE.match(char):
+                continue
+            self.current_line += char
+
+    def _commit_current_line(self) -> None:
+        line = self.current_line.rstrip()
+        if line or (self.lines and self.lines[-1]):
+            self.lines.append(line)
+        self.current_line = ""
+
+    def _render(self) -> str:
+        output_lines = list(self.lines)
+        current_line = self.current_line.rstrip()
+        if current_line:
+            output_lines.append(current_line)
+
+        rendered = "\n".join(output_lines).strip()
+        if len(rendered) <= self.max_chars:
+            return rendered
+
+        trimmed = rendered[-self.max_chars :]
+        newline_index = trimmed.find("\n")
+        if newline_index != -1:
+            trimmed = trimmed[newline_index + 1 :]
+        return trimmed.strip()
 
 
 class RelayServer:
@@ -319,6 +338,15 @@ def write_all(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def runtime_environment() -> dict[str, str]:
+    env = dict(os.environ)
+    term = env.get("TERM", "").strip().lower()
+    if not term or term == "dumb":
+        env["TERM"] = "xterm-256color"
+    env.setdefault("COLORTERM", "truecolor")
+    return env
+
+
 def main() -> int:
     args = parse_args()
     registry_dir = Path(args.registry_dir).expanduser()
@@ -339,14 +367,13 @@ def main() -> int:
             sync_window_size(stdin_fd, slave_fd)
         except OSError:
             pass
-    env = dict(os.environ)
     process = subprocess.Popen(
         args.command,
         cwd=args.cwd,
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
-        env=env,
+        env=runtime_environment(),
         close_fds=True,
         start_new_session=True,
     )

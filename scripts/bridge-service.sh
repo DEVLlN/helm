@@ -9,14 +9,6 @@ RUNTIME_DIR="${HELM_PROTOTYPE_RUNTIME_DIR:-$ROOT_DIR/.runtime/launchd}"
 LOG_DIR="$RUNTIME_DIR/logs"
 STDOUT_LOG="$LOG_DIR/helm-bridge-service.out.log"
 STDERR_LOG="$LOG_DIR/helm-bridge-service.err.log"
-
-for candidate in "$HOME/.local/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
-  if [[ -d "$candidate" ]] && [[ ":$PATH:" != *":$candidate:"* ]]; then
-    PATH="$candidate:$PATH"
-  fi
-done
-export PATH
-
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
 GUI_DOMAIN="gui/$(id -u)"
 

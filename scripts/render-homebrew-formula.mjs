@@ -10,26 +10,26 @@ const packageJSON = JSON.parse(readFileSync(join(rootDir, "package.json"), "utf8
 function usage() {
   console.log(`Usage: node scripts/render-homebrew-formula.mjs [--version X.Y.Z] [--sha256 SHA256] [--owner GITHUB_OWNER] [--repo GITHUB_REPO] [--url SOURCE_URL]
 
-Render the Homebrew formula for the public homebrew-helm tap.
+Render the Homebrew formula for the homebrew-helm tap.
 
 Defaults:
   version  ${packageJSON.version}
   owner    DEVLlN
-  repo     helm
+  repo     helm-dev
 
 Example:
   node scripts/render-homebrew-formula.mjs --version ${packageJSON.version} --sha256 <tarball-sha256>
 
 Install path after publishing:
-  brew tap devlln/helm
-  brew install devlln/helm/helm
+  brew tap devlin/helm
+  brew install devlin/helm/helm
 `);
 }
 
 let version = packageJSON.version;
 let sha256 = "REPLACE_WITH_RELEASE_TARBALL_SHA256";
 let owner = "DEVLlN";
-let repo = "helm";
+let repo = "helm-dev";
 let sourceURL = "";
 
 const args = process.argv.slice(2);

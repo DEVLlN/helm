@@ -6,13 +6,6 @@ BRIDGE_DIR="$ROOT_DIR/bridge"
 BIN_DIR="${HOME}/.local/bin"
 SHIM_DIR="${HOME}/.local/share/helm/runtime-shims"
 
-for candidate in "$HOME/.local/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
-  if [[ -d "$candidate" ]] && [[ ":$PATH:" != *":$candidate:"* ]]; then
-    PATH="$candidate:$PATH"
-  fi
-done
-export PATH
-
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required command: $1" >&2
@@ -39,12 +32,14 @@ link_script() {
 
 link_script "$ROOT_DIR/bin/helm.js" "helm"
 link_script "$ROOT_DIR/scripts/install-helm.sh" "helm-install"
+link_script "$ROOT_DIR/scripts/install-helm-mac-app.sh" "helm-install-mac-app"
 link_script "$ROOT_DIR/scripts/prototype-up.sh" "helm-prototype-up"
 link_script "$ROOT_DIR/scripts/prototype-status.sh" "helm-prototype-status"
 link_script "$ROOT_DIR/scripts/prototype-down.sh" "helm-prototype-down"
 link_script "$ROOT_DIR/scripts/bridge-service.sh" "helm-bridge-service"
 link_script "$ROOT_DIR/scripts/print-pairing-qr.sh" "helm-pairing-qr"
 link_script "$ROOT_DIR/scripts/detect-helm-platforms.sh" "helm-platforms"
+link_script "$ROOT_DIR/scripts/install-local-prototypes.sh" "helm-install-local-prototypes"
 link_script "$ROOT_DIR/scripts/install-helm-shell-integration.sh" "helm-enable-shell-integration"
 link_script "$ROOT_DIR/scripts/install-helm-runtime-shims.sh" "helm-enable-runtime-shims"
 link_script "$ROOT_DIR/scripts/install-helm-binary-capture.sh" "helm-enable-binary-capture"
@@ -71,12 +66,14 @@ Installed helper commands in:
 Available helpers:
   helm
   helm-install
+  helm-install-mac-app
   helm-prototype-up
   helm-prototype-status
   helm-prototype-down
   helm-bridge-service
   helm-pairing-qr
   helm-platforms
+  helm-install-local-prototypes
   helm-enable-shell-integration
   helm-enable-runtime-shims
   helm-enable-binary-capture
@@ -97,16 +94,14 @@ Recommended next steps:
      helm setup
   2. Or, if you prefer the lower-level steps, enable shell integration explicitly:
      helm-enable-shell-integration
-  3. Relaunch GUI apps like Codex, Claude, and Grok so they inherit helm's runtime shim PATH.
+  3. Relaunch GUI apps like Codex, Claude, Grok, and VS Code so they inherit helm's runtime shim PATH.
   4. Start the bridge for cross-device use:
      helm-prototype-up
-  5. Or install a launchd background service:
-     helm-bridge-service install
-  6. Print a pairing QR in the terminal if you need it again:
-     helm pair
-  7. In a Helm client, scan the pairing QR.
-  8. Start Codex CLI, Claude Code, or Grok CLI sessions normally.
-  9. If Ollama is installed, start local model sessions with:
+  5. Print a pairing QR in the terminal if you need it again:
+     helm-pairing-qr
+  6. In helm on iPhone, scan the pairing QR.
+  7. Start Codex CLI, Claude Code, or Grok CLI sessions normally.
+  8. If Ollama is installed, start local model sessions with:
      helm-gemma
      helm-qwen
 
