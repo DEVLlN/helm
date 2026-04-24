@@ -12,6 +12,7 @@ import type {
 } from "./types.js";
 
 type BridgeServerInternals = {
+  enrichThreadSummaries(threads: ThreadSummary[]): Promise<ThreadSummary[]>;
   listThreadsForResponse(): Promise<ThreadSummary[]>;
   withControllerMetadata(threads: ThreadSummary[]): ThreadSummary[];
   fallbackThreadDetailForResponse(
@@ -19,7 +20,8 @@ type BridgeServerInternals = {
     summary: ThreadSummary | null,
     options?: {
       includeLiveRuntimeTail?: boolean;
-    }
+    },
+    cached?: ThreadDetail | null
   ): Promise<ThreadDetail | null>;
   readNormalizedThreadDetailForResponse(
     threadId: string,
@@ -58,9 +60,16 @@ type BridgeServerInternals = {
     fallbackPreview?: string | null,
     fallbackName?: string | null
   ): string;
+  threadPreviewFromDetail(detail: ThreadDetail): string;
   threadSummaryNeedsOpportunisticDetailRefresh(thread: ThreadSummary): boolean;
+  shouldRefreshPolledThreadDetail(
+    summary: ThreadSummary,
+    cached: ThreadDetail,
+    threadId: string
+  ): boolean;
   withLiveRuntimeTail(detail: ThreadDetail, backendId: string): ThreadDetail;
   liveRuntimeOutputTailForThread(threadId: string, backendId: string): { updatedAt: number; text: string } | null;
+  codexLocalThreadSnapshot(threadId: string): Promise<{ turns: JSONValue[]; updatedAt: number | null }>;
 };
 
 function compactItem(item: ThreadDetailItem): ThreadDetailItem {
@@ -109,6 +118,38 @@ function threadItem(overrides: Partial<ThreadDetailItem>): ThreadDetailItem {
   };
 }
 
+function testBackendSummary(): BackendSummary {
+  return {
+    id: "codex",
+    label: "Codex",
+    kind: "codex",
+    description: "Codex backend",
+    isDefault: true,
+    available: true,
+    capabilities: {
+      threadListing: true,
+      threadCreation: true,
+      turnExecution: true,
+      turnInterrupt: true,
+      approvals: true,
+      planMode: true,
+      voiceCommand: false,
+      realtimeVoice: false,
+      hooksAndSkillsParity: true,
+      sharedThreadHandoff: true,
+    },
+    command: {
+      routing: "threadTurns",
+      approvals: "bridgeDecisions",
+      handoff: "sharedThread",
+      voiceInput: "bridgeRealtime",
+      voiceOutput: "bridgeSpeech",
+      supportsCommandFollowups: true,
+      notes: "Test backend.",
+    },
+  };
+}
+
 test("thread detail compaction preserves the tail of long agent messages", () => {
   const prefix = "BEGINNING-ONLY ";
   const suffix = " THE-LATEST-ASSISTANT-TEXT";
@@ -148,7 +189,72 @@ test("thread preview resolution preserves existing nonblank previews", () => {
   assert.equal(server.resolvedThreadPreview("", "idle", null), "");
 });
 
-test("idle thread preview merge preserves a stable concise fallback", () => {
+test("thread previews prefer the newest turn text in newest-first thread order", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+  const preview = server.threadPreviewFromDetail({
+    id: "thread-1",
+    name: "Thread",
+    cwd: "/tmp/project",
+    workspacePath: "/tmp/project",
+    status: "running",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {} as ThreadDetail["command"],
+    affordances: {} as ThreadDetail["affordances"],
+    turns: [
+      {
+        id: "turn-2",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "user-new",
+            turnId: "turn-2",
+            type: "userMessage",
+            title: "User message",
+            rawText: "Newest prompt",
+            detail: "Newest prompt",
+          }),
+          threadItem({
+            id: "agent-new",
+            turnId: "turn-2",
+            rawText: "Newest reply",
+            detail: "Newest reply",
+          }),
+        ],
+      },
+      {
+        id: "turn-1",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "user-old",
+            turnId: "turn-1",
+            type: "userMessage",
+            title: "User message",
+            rawText: "Older prompt",
+            detail: "Older prompt",
+          }),
+          threadItem({
+            id: "agent-old",
+            turnId: "turn-1",
+            rawText: "Older reply",
+            detail: "Older reply",
+          }),
+        ],
+      },
+    ],
+  });
+
+  assert.equal(preview, "Newest prompt\nNewest reply");
+});
+
+test("idle thread preview merge prefers fresh detail over stale fallback text", () => {
   const server = new BridgeServer() as unknown as BridgeServerInternals;
   assert.equal(
     server.mergedThreadPreview(
@@ -156,7 +262,7 @@ test("idle thread preview merge preserves a stable concise fallback", () => {
       "idle",
       "Control Mac mini remotely"
     ),
-    "Control Mac mini remotely"
+    "I’m narrowing this to the usual macOS causes and collecting exact references now."
   );
 });
 
@@ -232,6 +338,46 @@ test("title-echo thread summaries are considered low-signal for enrichment", () 
   );
 });
 
+test("recently updated idle summaries still refresh detail even with non-generic previews", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+  assert.equal(
+    server.threadSummaryNeedsOpportunisticDetailRefresh({
+      id: "thread-3",
+      name: "Add pre-turn message fold",
+      preview: "Let's add the pre-turn message fold.",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      status: "idle",
+      updatedAt: Date.now(),
+      sourceKind: "vscode",
+      launchSource: null,
+      backendId: "codex",
+      backendLabel: "Codex",
+      backendKind: "codex",
+      controller: null,
+    }),
+    true
+  );
+  assert.equal(
+    server.threadSummaryNeedsOpportunisticDetailRefresh({
+      id: "thread-4",
+      name: "Older thread",
+      preview: "Older but non-generic preview",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      status: "idle",
+      updatedAt: Date.now() - 5 * 60 * 1000,
+      sourceKind: "vscode",
+      launchSource: null,
+      backendId: "codex",
+      backendLabel: "Codex",
+      backendKind: "codex",
+      controller: null,
+    }),
+    false
+  );
+});
+
 test("thread list preserves backend-provided controller metadata when no local override exists", () => {
   const server = new BridgeServer() as unknown as BridgeServerInternals;
   const controller = {
@@ -271,7 +417,7 @@ test("thread list enrichment fetches detail for generic summaries", async () => 
   server.scheduleThreadDetailBroadcast = (threadId: string) => {
     scheduled.push(threadId);
   };
-  server.readNormalizedThreadDetail = async (threadId: string) => {
+  server.readNormalizedThreadDetailForResponse = async (threadId: string) => {
     requested.push(threadId);
     if (threadId !== "thread-1") {
       return null;
@@ -378,6 +524,168 @@ test("thread list enrichment fetches detail for generic summaries", async () => 
     enriched.find((thread) => thread.id === "thread-2")?.preview,
     "Daily bug scan"
   );
+});
+
+test("thread list enrichment uses fallback-aware detail reads for recent stale summaries", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  let readCount = 0;
+
+  server.liveCachedThreadDetail = () => null;
+  server.scheduleThreadDetailBroadcast = () => {};
+  server.readNormalizedThreadDetailForResponse = async () => {
+    readCount += 1;
+    return {
+      id: "thread-1",
+      name: "Add pre-turn message fold",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      status: "idle",
+      updatedAt: 124_000,
+      sourceKind: "vscode",
+      launchSource: null,
+      backendId: "codex",
+      backendLabel: "Codex",
+      backendKind: "codex",
+      command: {
+        routing: "threadTurns",
+        approvals: "bridgeDecisions",
+        handoff: "sharedThread",
+        voiceInput: "bridgeRealtime",
+        voiceOutput: "bridgeSpeech",
+        supportsCommandFollowups: true,
+        notes: "Command routes into shared Codex threads on the Mac.",
+      },
+      affordances: {
+        canSendTurns: true,
+        canInterrupt: true,
+        canRespondToApprovals: true,
+        canUseRealtimeCommand: true,
+        showsOperationalSnapshot: true,
+        sessionAccess: "sharedThread",
+        notes: "Shared thread bridge session.",
+      },
+      turns: [
+        {
+          id: "turn-1",
+          status: "completed",
+          error: null,
+          items: [
+            threadItem({
+              id: "user-1",
+              turnId: "turn-1",
+              type: "userMessage",
+              title: "User message",
+              rawText: "Latest mobile bridge complaint",
+              detail: "Latest mobile bridge complaint",
+            }),
+            threadItem({
+              id: "agent-1",
+              turnId: "turn-1",
+              rawText: "Fresh detail preview",
+              detail: "Fresh detail preview",
+            }),
+          ],
+        },
+      ],
+    } satisfies ThreadDetail;
+  };
+
+  const enriched = await server.enrichThreadSummaries([
+    {
+      id: "thread-1",
+      name: "Add pre-turn message fold",
+      preview: "Let's add the pre-turn message fold.",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      status: "idle",
+      updatedAt: Date.now(),
+      sourceKind: "vscode",
+      launchSource: null,
+      backendId: "codex",
+      backendLabel: "Codex",
+      backendKind: "codex",
+      controller: null,
+    },
+  ]);
+
+  assert.equal(readCount, 1);
+  assert.equal(enriched[0]?.preview, "Latest mobile bridge complaint\nFresh detail preview");
+});
+
+test("thread list enrichment refreshes top stale idle summaries from detail", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  let readCount = 0;
+
+  server.liveCachedThreadDetail = () => null;
+  server.scheduleThreadDetailBroadcast = () => {};
+  server.readNormalizedThreadDetailForResponse = async () => {
+    readCount += 1;
+    return {
+      id: "thread-1",
+      name: "Add pre-turn message fold",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      status: "idle",
+      updatedAt: Date.now(),
+      sourceKind: "vscode",
+      launchSource: null,
+      backendId: "codex",
+      backendLabel: "Codex",
+      backendKind: "codex",
+      command: {} as ThreadDetail["command"],
+      affordances: {} as ThreadDetail["affordances"],
+      turns: [
+        {
+          id: "turn-1",
+          status: "completed",
+          error: null,
+          items: [
+            threadItem({
+              id: "user-1",
+              turnId: "turn-1",
+              type: "userMessage",
+              title: "User message",
+              rawText: "mobile still does not show the most recent messages",
+              detail: "mobile still does not show the most recent messages",
+            }),
+            threadItem({
+              id: "agent-1",
+              turnId: "turn-1",
+              rawText: "The final assistant reply is now available.",
+              detail: "The final assistant reply is now available.",
+              status: "final_answer",
+            }),
+          ],
+        },
+      ],
+    } satisfies ThreadDetail;
+  };
+
+  const staleUpdatedAt = Date.now() - 60 * 60 * 1000;
+  const enriched = await server.enrichThreadSummaries([
+    {
+      id: "thread-1",
+      name: "Add pre-turn message fold",
+      preview: "The code change is in. I'm running a focused iOS test slice first.",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      status: "idle",
+      updatedAt: staleUpdatedAt,
+      sourceKind: "vscode",
+      launchSource: null,
+      backendId: "codex",
+      backendLabel: "Codex",
+      backendKind: "codex",
+      controller: null,
+    },
+  ]);
+
+  assert.equal(readCount, 1);
+  assert.equal(
+    enriched[0]?.preview,
+    "mobile still does not show the most recent messages\nThe final assistant reply is now available."
+  );
+  assert.ok((enriched[0]?.updatedAt ?? 0) > staleUpdatedAt);
 });
 
 test("thread list response overlays fresher cached detail onto stale cached summaries", async () => {
@@ -505,6 +813,152 @@ test("thread detail fallback uses local codex turns before an empty placeholder"
   );
 });
 
+test("thread detail fallback prefers fuller local codex turns over stale cached detail", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const summary: ThreadSummary = {
+    id: "thread-1",
+    name: "Add pre-turn message fold",
+    preview: "Older cached preview",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+
+  const cachedDetail = {
+    id: "thread-1",
+    name: "Add pre-turn message fold",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 122_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {
+      routing: "threadTurns",
+      approvals: "bridgeDecisions",
+      handoff: "sharedThread",
+      voiceInput: "bridgeRealtime",
+      voiceOutput: "bridgeSpeech",
+      supportsCommandFollowups: true,
+      notes: "Command routes into shared Codex threads on the Mac.",
+    },
+    affordances: {
+      canSendTurns: true,
+      canInterrupt: true,
+      canRespondToApprovals: true,
+      canUseRealtimeCommand: true,
+      showsOperationalSnapshot: true,
+      sessionAccess: "sharedThread",
+      notes: "Shared thread bridge session.",
+    },
+    turns: [
+      {
+        id: "turn-older",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "cached-user",
+            turnId: "turn-older",
+            type: "userMessage",
+            title: "User message",
+            rawText: "Older prompt",
+            detail: "Older prompt",
+          }),
+          threadItem({
+            id: "cached-agent",
+            turnId: "turn-older",
+            rawText: "Older reply",
+            detail: "Older reply",
+          }),
+        ],
+      },
+      {
+        id: "turn-oldest",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "cached-agent-2",
+            turnId: "turn-oldest",
+            rawText: "Oldest reply",
+            detail: "Oldest reply",
+          }),
+        ],
+      },
+    ],
+  } satisfies ThreadDetail;
+
+  server.codexLocalThreadTurns = async () => [
+    {
+      id: "turn-live",
+      status: "running",
+      items: [
+        {
+          id: "user-live",
+          type: "userMessage",
+          content: {
+            text: "continue. had to restart my comp.\n",
+          },
+        },
+        {
+          id: "agent-live",
+          type: "agentMessage",
+          text: "The bridge detail is still behind the desktop thread.",
+          phase: "commentary",
+        },
+      ],
+    },
+    {
+      id: "turn-older",
+      status: "completed",
+      items: [
+        {
+          id: "cached-user",
+          type: "userMessage",
+          content: {
+            text: "Older prompt\n",
+          },
+        },
+        {
+          id: "cached-agent",
+          type: "agentMessage",
+          text: "Older reply",
+          phase: "final_answer",
+        },
+      ],
+    },
+    {
+      id: "turn-oldest",
+      status: "completed",
+      items: [
+        {
+          id: "cached-agent-2",
+          type: "agentMessage",
+          text: "Oldest reply",
+          phase: "final_answer",
+        },
+      ],
+    },
+  ];
+
+  const detail = await server.fallbackThreadDetailForResponse(summary.id, summary, {}, cachedDetail);
+
+  assert.equal(detail?.turns.length, 3);
+  assert.equal(detail?.turns[0]?.id, "turn-live");
+  assert.equal(detail?.turns[0]?.items[0]?.detail?.trim(), "continue. had to restart my comp.");
+});
+
 test("thread detail response prefers local codex turns over an empty live read", async () => {
   const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
   const summary: ThreadSummary = {
@@ -609,6 +1063,408 @@ test("thread detail response prefers local codex turns over an empty live read",
   assert.equal(detail?.turns[0]?.items[0]?.detail, "Recovered local rollout detail.");
 });
 
+test("thread detail response prefers fuller local codex fallback over stale live detail", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const summary: ThreadSummary = {
+    id: "thread-1",
+    name: "Add pre-turn message fold",
+    preview: "Older cached preview",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+
+  const staleDetail = {
+    id: "thread-1",
+    name: "Add pre-turn message fold",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 122_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {
+      routing: "threadTurns",
+      approvals: "bridgeDecisions",
+      handoff: "sharedThread",
+      voiceInput: "bridgeRealtime",
+      voiceOutput: "bridgeSpeech",
+      supportsCommandFollowups: true,
+      notes: "Command routes into shared Codex threads on the Mac.",
+    },
+    affordances: {
+      canSendTurns: true,
+      canInterrupt: true,
+      canRespondToApprovals: true,
+      canUseRealtimeCommand: true,
+      showsOperationalSnapshot: true,
+      sessionAccess: "sharedThread",
+      notes: "Shared thread bridge session.",
+    },
+    turns: [
+      {
+        id: "turn-older",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "cached-agent",
+            turnId: "turn-older",
+            rawText: "Older reply",
+            detail: "Older reply",
+          }),
+        ],
+      },
+    ],
+  } satisfies ThreadDetail;
+
+  server.liveCachedThreadDetail = () => staleDetail;
+  server.cachedThreadSummary = () => summary;
+  server.discoverLocalCodexThreadSummary = async () => summary;
+  server.codexLocalThreadTurns = async () => [
+    {
+      id: "turn-live",
+      status: "running",
+      items: [
+        {
+          id: "agent-live",
+          type: "agentMessage",
+          text: "Fresh rollout detail.",
+          phase: "commentary",
+        },
+        {
+          id: "command-live",
+          type: "commandExecution",
+          command: "/bin/zsh -lc git status --short",
+          status: "completed",
+          aggregatedOutput: " M bridge/src/bridgeServer.ts\n",
+        },
+      ],
+    },
+    {
+      id: "turn-older",
+      status: "completed",
+      items: [
+        {
+          id: "cached-agent",
+          type: "agentMessage",
+          text: "Older reply",
+          phase: "final_answer",
+        },
+      ],
+    },
+  ];
+  server.readNormalizedThreadDetailCoalesced = async () => staleDetail;
+
+  const detail = await server.readNormalizedThreadDetailForResponse(summary.id);
+
+  assert.equal(detail?.turns.length, 2);
+  assert.equal(detail?.turns[0]?.id, "turn-live");
+  assert.equal(detail?.turns[0]?.items[0]?.detail, "Fresh rollout detail.");
+});
+
+test("thread detail response prefers newer local codex fallback over larger stale cache", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const summary: ThreadSummary = {
+    id: "thread-1",
+    name: "Fix mobile feed recent messages",
+    preview: "Older cached preview",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "idle",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+  const staleUpdatedAt = Date.parse("2026-04-23T21:11:57.524Z");
+  const freshUpdatedAt = Date.parse("2026-04-23T21:17:58.007Z");
+  const staleItems = Array.from({ length: 30 }, (_, index) => (
+    threadItem({
+      id: `local-command-${index + 1}`,
+      turnId: "turn-live",
+      type: "commandExecution",
+      title: `/bin/zsh -lc stale-${index + 1}`,
+      rawText: `stale output ${index + 1}`,
+      detail: `stale output ${index + 1}`,
+    })
+  ));
+  const staleDetail = {
+    id: summary.id,
+    name: summary.name,
+    cwd: summary.cwd,
+    workspacePath: summary.workspacePath,
+    status: "idle",
+    updatedAt: staleUpdatedAt,
+    sourceKind: summary.sourceKind,
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {} as ThreadDetail["command"],
+    affordances: {} as ThreadDetail["affordances"],
+    turns: [
+      {
+        id: "turn-live",
+        status: "running",
+        error: null,
+        items: staleItems,
+      },
+      {
+        id: "turn-older",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "local-agent-older",
+            turnId: "turn-older",
+            rawText: "Older final reply",
+            detail: "Older final reply",
+          }),
+        ],
+      },
+    ],
+  } satisfies ThreadDetail;
+
+  server.liveCachedThreadDetail = () => staleDetail;
+  server.cachedThreadSummary = () => summary;
+  server.discoverLocalCodexThreadSummary = async () => summary;
+  server.readNormalizedThreadDetailCoalesced = async () => staleDetail;
+  const freshTurns: JSONValue[] = [
+    {
+      id: "turn-live",
+      status: "running",
+      items: [
+        {
+          id: "local-user-1",
+          type: "userMessage",
+          content: { text: "Fix the final message stall." },
+        },
+        {
+          id: "local-agent-31",
+          type: "agentMessage",
+          text: "The bridge still has stale cached material.",
+          phase: "commentary",
+        },
+        {
+          id: "local-command-32",
+          type: "commandExecution",
+          command: "/bin/zsh -lc curl fresh detail",
+          status: "completed",
+          aggregatedOutput: "apiUpdatedAt=2026-04-23T21:17:58Z",
+        },
+      ],
+    },
+  ];
+  server.codexLocalThreadSnapshot = async () => ({
+    updatedAt: freshUpdatedAt,
+    turns: freshTurns,
+  });
+
+  const detail = await server.readNormalizedThreadDetailForResponse(summary.id, {
+    preferFresh: true,
+  });
+  const latestTurn = detail?.turns.find((turn) => turn.id === "turn-live");
+
+  assert.equal(detail?.updatedAt, freshUpdatedAt);
+  assert.equal(latestTurn?.items.at(-1)?.id, "local-command-32");
+  assert.equal(detail?.turns.some((turn) => turn.id === "turn-older"), true);
+});
+
+test("thread detail response stamps local codex fallback with rollout freshness", async () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const summary: ThreadSummary = {
+    id: "thread-1",
+    name: "Fix mobile feed recent messages",
+    preview: "Older cached preview",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: 123_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+  const rolloutUpdatedAt = Date.parse("2026-04-23T20:57:20.200Z");
+
+  server.liveCachedThreadDetail = () => null;
+  server.cachedThreadSummary = () => summary;
+  server.discoverLocalCodexThreadSummary = async () => summary;
+  server.readNormalizedThreadDetailCoalesced = async () => null;
+  server.codexLocalThreadSnapshot = async () => ({
+    updatedAt: rolloutUpdatedAt,
+    turns: [
+      {
+        id: "turn-live",
+        status: "running",
+        items: [
+          {
+            id: "command-live",
+            type: "commandExecution",
+            command: "/bin/zsh -lc git status --short",
+            status: "completed",
+          },
+        ],
+      },
+    ],
+  });
+
+  const detail = await server.readNormalizedThreadDetailForResponse(summary.id, {
+    preferFresh: true,
+  });
+
+  assert.equal(detail?.updatedAt, rolloutUpdatedAt);
+  assert.equal(detail?.turns[0]?.items[0]?.title, "/bin/zsh -lc git status --short");
+});
+
+test("polled Codex detail keeps refreshing across the completion boundary", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const threadId = "thread-1";
+  const now = Date.now();
+  const summary: ThreadSummary = {
+    id: threadId,
+    name: "Fix mobile feed recent messages",
+    preview: "Older cached preview",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "idle",
+    updatedAt: now - 60_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+  const cachedDetail = {
+    id: threadId,
+    name: "Fix mobile feed recent messages",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "running",
+    updatedAt: now - 1_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {
+      routing: "threadTurns",
+      approvals: "bridgeDecisions",
+      handoff: "sharedThread",
+      voiceInput: "bridgeRealtime",
+      voiceOutput: "bridgeSpeech",
+      supportsCommandFollowups: true,
+      notes: "Command routes into shared Codex threads on the Mac.",
+    },
+    affordances: {
+      canSendTurns: true,
+      canInterrupt: true,
+      canRespondToApprovals: true,
+      canUseRealtimeCommand: true,
+      showsOperationalSnapshot: true,
+      sessionAccess: "sharedThread",
+      notes: "Shared thread bridge session.",
+    },
+    turns: [
+      {
+        id: "turn-live",
+        status: "running",
+        error: null,
+        items: [
+          threadItem({
+            id: "agent-live",
+            turnId: "turn-live",
+            rawText: "Almost done; final reply is about to land.",
+            detail: "Almost done; final reply is about to land.",
+          }),
+        ],
+      },
+    ],
+  } satisfies ThreadDetail;
+
+  server.threadDetailPollRefreshAt = new Map([[threadId, now - 1_000]]);
+
+  assert.equal(
+    server.shouldRefreshPolledThreadDetail(summary, cachedDetail, threadId),
+    true
+  );
+});
+
+test("recent idle Codex details keep trailing refreshes for final-message pickup", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
+  const threadId = "thread-1";
+  const now = Date.now();
+  const summary: ThreadSummary = {
+    id: threadId,
+    name: "Fix mobile feed recent messages",
+    preview: "Older cached preview",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "idle",
+    updatedAt: now - 60_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    controller: null,
+  };
+  const cachedDetail = {
+    id: threadId,
+    name: "Fix mobile feed recent messages",
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    workspacePath: "/Users/devlin/GitHub/helm-dev",
+    status: "idle",
+    updatedAt: now - 1_000,
+    sourceKind: "vscode",
+    launchSource: null,
+    backendId: "codex",
+    backendLabel: "Codex",
+    backendKind: "codex",
+    command: {} as ThreadDetail["command"],
+    affordances: {} as ThreadDetail["affordances"],
+    turns: [
+      {
+        id: "turn-live",
+        status: "completed",
+        error: null,
+        items: [
+          threadItem({
+            id: "agent-live",
+            turnId: "turn-live",
+            rawText: "The most recent final reply.",
+            detail: "The most recent final reply.",
+          }),
+        ],
+      },
+    ],
+  } satisfies ThreadDetail;
+
+  server.threadDetailPollRefreshAt = new Map([[threadId, now - 3_000]]);
+
+  assert.equal(
+    server.shouldRefreshPolledThreadDetail(summary, cachedDetail, threadId),
+    true
+  );
+});
+
 test("thread detail fallback publication updates stale thread list previews", async () => {
   const server = new BridgeServer() as unknown as BridgeServerInternals & Record<string, unknown>;
   const summary: ThreadSummary = {
@@ -659,35 +1515,7 @@ test("thread detail fallback publication updates stale thread list previews", as
 
 test("recent empty thread details do not infer running without turns", () => {
   const server = new BridgeServer() as unknown as BridgeServerInternals;
-  const backend: BackendSummary = {
-    id: "codex",
-    label: "Codex",
-    kind: "codex",
-    description: "Codex backend",
-    isDefault: true,
-    available: true,
-    capabilities: {
-      threadListing: true,
-      threadCreation: true,
-      turnExecution: true,
-      turnInterrupt: true,
-      approvals: true,
-      planMode: true,
-      voiceCommand: false,
-      realtimeVoice: false,
-      hooksAndSkillsParity: true,
-      sharedThreadHandoff: true,
-    },
-    command: {
-      routing: "threadTurns",
-      approvals: "bridgeDecisions",
-      handoff: "sharedThread",
-      voiceInput: "bridgeRealtime",
-      voiceOutput: "bridgeSpeech",
-      supportsCommandFollowups: true,
-      notes: "Test backend.",
-    },
-  };
+  const backend = testBackendSummary();
   const detail = server.normalizeThreadDetail(
     {
       thread: {
@@ -702,6 +1530,62 @@ test("recent empty thread details do not infer running without turns", () => {
   );
 
   assert.equal(detail?.status, "idle");
+});
+
+test("normalized thread details keep the newest turns when trimming newest-first histories", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+  const backend = testBackendSummary();
+  const turns = Array.from({ length: 18 }, (_, index) => {
+    const turnNumber = 18 - index;
+    return {
+      id: `turn-${turnNumber}`,
+      status: "completed",
+      items: [
+        {
+          id: `user-${turnNumber}`,
+          type: "userMessage",
+          content: {
+            text: `Prompt ${turnNumber}`,
+          },
+        },
+      ],
+    };
+  });
+
+  const detail = server.normalizeThreadDetail(
+    {
+      thread: {
+        id: "thread-1",
+        name: "Thread",
+        cwd: "/tmp/project",
+        updatedAt: Date.now(),
+        turns,
+      },
+    },
+    backend
+  );
+
+  assert.deepEqual(
+    detail?.turns.map((turn) => turn.id),
+    [
+      "turn-18",
+      "turn-17",
+      "turn-16",
+      "turn-15",
+      "turn-14",
+      "turn-13",
+      "turn-12",
+      "turn-11",
+      "turn-10",
+      "turn-9",
+      "turn-8",
+      "turn-7",
+      "turn-6",
+      "turn-5",
+      "turn-4",
+      "turn-3",
+    ]
+  );
 });
 
 test("preferredThreadStatus can demote recent unknown summaries to idle", () => {
@@ -750,6 +1634,119 @@ test("command execution normalization keeps full output before terminal tail com
   const compacted = compactItem(normalized);
   assert.equal(compacted.rawText?.endsWith(suffix), true);
   assert.equal(compacted.rawText?.includes(prefix), false);
+});
+
+test("thread detail appends a turn-level file change summary after the final answer", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+  const detail = server.normalizeThreadDetail(
+    {
+      thread: {
+        id: "thread-1",
+        name: "Thread",
+        cwd: "/tmp/project",
+        status: "idle",
+        updatedAt: Date.now(),
+        turns: [{
+          id: "turn-1",
+          status: "completed",
+          items: [
+            {
+              id: "change-1",
+              type: "fileChange",
+              status: "completed",
+              changes: [{
+                path: "/tmp/project/ios/Sources/SessionFeedView.swift",
+                type: "modified",
+                unified_diff: "@@ -1 +1 @@\n-old\n+new",
+              }],
+            },
+            {
+              id: "change-2",
+              type: "fileChange",
+              status: "completed",
+              changes: [{
+                path: "/tmp/project/ios/Tests/CodexVoiceRemoteTests.swift",
+                type: "modified",
+                unified_diff: "@@ -2 +2 @@\n-old\n+new",
+              }],
+            },
+            {
+              id: "agent-final",
+              type: "agentMessage",
+              phase: "final_answer",
+              text: "Fixed it.",
+            },
+          ],
+        }],
+      },
+    },
+    testBackendSummary()
+  );
+
+  const items = detail?.turns[0]?.items ?? [];
+  const summaryItem = items.at(-1);
+  assert.equal(items.at(-2)?.id, "agent-final");
+  assert.equal(summaryItem?.id, "turn-file-change-summary-turn-1");
+  assert.equal(summaryItem?.type, "fileChange");
+  assert.equal(summaryItem?.title, "2 files changed");
+  assert.equal(
+    summaryItem?.detail,
+    "2 files changed | 2 modified | /tmp/project/ios/Sources/SessionFeedView.swift, /tmp/project/ios/Tests/CodexVoiceRemoteTests.swift"
+  );
+  assert.match(summaryItem?.rawText ?? "", /SessionFeedView\.swift/);
+  assert.match(summaryItem?.rawText ?? "", /CodexVoiceRemoteTests\.swift/);
+});
+
+test("thread detail keeps a file change summary at the tail of running turns", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+  const detail = server.normalizeThreadDetail(
+    {
+      thread: {
+        id: "thread-1",
+        name: "Thread",
+        cwd: "/tmp/project",
+        status: "running",
+        updatedAt: Date.now(),
+        turns: [{
+          id: "turn-1",
+          status: "running",
+          items: [
+            {
+              id: "change-1",
+              type: "fileChange",
+              status: "completed",
+              changes: [{
+                path: "/tmp/project/bridge/src/bridgeServer.ts",
+                type: "modified",
+                unified_diff: "@@ -1 +1 @@\n-old\n+new",
+              }],
+            },
+            {
+              id: "agent-progress",
+              type: "agentMessage",
+              phase: "commentary",
+              text: "I am checking the live payload now.",
+            },
+            {
+              id: "command-1",
+              type: "commandExecution",
+              command: "git diff --check",
+              status: "completed",
+              aggregatedOutput: "",
+            },
+          ],
+        }],
+      },
+    },
+    testBackendSummary()
+  );
+
+  const items = detail?.turns[0]?.items ?? [];
+  const summaryItem = items.at(-1);
+  assert.equal(summaryItem?.id, "turn-file-change-summary-turn-1");
+  assert.equal(summaryItem?.title, "1 file changed");
+  assert.equal(summaryItem?.detail, "1 file changed | 1 modified | /tmp/project/bridge/src/bridgeServer.ts");
+  assert.match(summaryItem?.rawText ?? "", /bridgeServer\.ts/);
 });
 
 test("oversized turns preserve the newest terminal rows instead of only conversation rows", () => {

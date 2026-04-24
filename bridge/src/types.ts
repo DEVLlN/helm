@@ -114,6 +114,23 @@ export type BackendSummary = {
   command: BackendCommandSemantics;
 };
 
+export type CommandModeDriverSummary = {
+  id: string;
+  label: string;
+  kind: "openai" | "custom";
+  model: string;
+  available: boolean;
+  availabilityDetail?: string;
+};
+
+export type CommandModeSummary = {
+  driver: CommandModeDriverSummary;
+  routing: BackendCommandRouting;
+  voiceProviderId?: string;
+  voiceProviderLabel?: string;
+  notes: string;
+};
+
 export type ConversationEvent = {
   method: string;
   params?: JSONValue;
@@ -244,6 +261,7 @@ export type VoiceCommandResponse = {
   spokenResponse: string | null;
   shouldResumeListening: boolean;
   backend: BackendSummary;
+  commandMode?: CommandModeSummary;
   result?: JSONValue;
 };
 

@@ -7,8 +7,8 @@ import type {
 export type VoiceProviderSummary = {
   id: string;
   label: string;
-  kind: "openai" | "personaplex" | "custom";
-  transport?: "openai-webrtc" | "personaplex-websocket" | "custom";
+  kind: "openai" | "personaplex" | "nvidia" | "custom";
+  transport?: "openai-webrtc" | "personaplex-websocket" | "openai-webrtc+nvidia-tts" | "custom";
   available: boolean;
   availabilityDetail?: string;
   supportsSpeechSynthesis: boolean;

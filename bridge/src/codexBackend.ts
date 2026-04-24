@@ -20,7 +20,7 @@ export class CodexBackend extends AgentBackend {
         turnExecution: true,
         turnInterrupt: true,
         approvals: true,
-        planMode: false,
+        planMode: true,
         voiceCommand: true,
         realtimeVoice: true,
         hooksAndSkillsParity: true,

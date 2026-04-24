@@ -10,6 +10,7 @@ import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 
 import type { AgentBackend } from "./agentBackend.js";
+import { CommandModeDriver } from "./commandModeDriver.js";
 import { config } from "./config.js";
 import { ClaudeCodeBackend } from "./claudeCodeBackend.js";
 import { CodexBackend } from "./codexBackend.js";
@@ -20,14 +21,23 @@ import {
   recordCodexThreadReplacement,
 } from "./codexThreadReplacementRegistry.js";
 import {
+  createCodexRolloutLiveMirrorController,
+  type CodexRolloutLiveMirrorController,
+  type CodexRolloutMirrorChange,
+} from "./codexRolloutLiveMirror.js";
+import {
+  type CodexThreadLocalSnapshot,
   codexThreadPreviewForDisplay,
   discoverCodexThread,
   preferredCodexThreadName,
+  readCodexThreadLocalSnapshot,
   readCodexThreadLocalTurns,
+  resolveCodexThreadRolloutPath,
   resolveCodexThreadByName,
 } from "./codexThreadDiscovery.js";
 import { HELM_RUNTIME_LAUNCH_SOURCE, isHelmManagedLaunchSource } from "./helmManagedLaunch.js";
 import { ManagedTerminalBackend } from "./managedTerminalBackend.js";
+import { NvidiaAIVoiceProvider } from "./nvidiaAIVoiceProvider.js";
 import { OpenAIVoiceProvider } from "./openAIVoiceProvider.js";
 import { PairingManager } from "./pairingManager.js";
 import { PersonaPlexVoiceProvider } from "./personaPlexVoiceProvider.js";
@@ -111,17 +121,17 @@ type CodexThreadRegistryRow = {
 };
 
 export class BridgeServer {
-  private static readonly THREAD_MIRROR_POLL_INTERVAL_MS = 250;
+  private static readonly THREAD_MIRROR_POLL_INTERVAL_MS = 150;
   private static readonly THREAD_MIRROR_RECENT_WINDOW_MS = 10 * 60 * 1000;
   private static readonly THREAD_MIRROR_MAX_THREADS = 8;
   private static readonly CODEX_LAUNCH_THREAD_DRIFT_MIN_MS = 60_000;
   private static readonly CODEX_IMPLICIT_RESUME_CANDIDATE_GAP_MS = 5 * 60_000;
   private static readonly THREAD_LIST_ENRICH_LIMIT = 6;
   private static readonly THREAD_DETAIL_BROADCAST_DEBOUNCE_MS = 20;
-  private static readonly THREAD_DETAIL_BURST_DELAYS_MS = [0, 120, 320, 900];
-  private static readonly THREAD_DETAIL_ACTIVE_POLL_REFRESH_INTERVAL_MS = 750;
+  private static readonly THREAD_DETAIL_BURST_DELAYS_MS = [0, 80, 220, 600];
+  private static readonly THREAD_DETAIL_ACTIVE_POLL_REFRESH_INTERVAL_MS = 350;
   private static readonly THREAD_DETAIL_POLL_REFRESH_INTERVAL_MS = 2_000;
-  private static readonly RUNTIME_TAIL_THREAD_DETAIL_REFRESH_INTERVAL_MS = 250;
+  private static readonly RUNTIME_TAIL_THREAD_DETAIL_REFRESH_INTERVAL_MS = 150;
   private static readonly THREAD_DETAIL_RESPONSE_FRESH_WAIT_MS = 450;
   private static readonly THREAD_DETAIL_STREAM_RESPONSE_FRESH_WAIT_MS = 1_500;
   private static readonly BACKEND_STARTUP_CONNECT_TIMEOUT_MS = 2_500;
@@ -167,6 +177,7 @@ export class BridgeServer {
   private readonly threadBackendIds = new Map<string, string>();
   private readonly voiceProviders = new Map<string, VoiceProvider>();
   private readonly defaultVoiceProviderId: string;
+  private readonly commandModeDriver = new CommandModeDriver();
   private readonly mirroredThreadDetailCache = new Map<string, string>();
   private readonly mirroredThreadDetailObjectCache = new Map<string, ThreadDetail>();
   private mirroredThreadListCache: string | null = null;
@@ -181,6 +192,7 @@ export class BridgeServer {
   private threadMirrorPollTimer: NodeJS.Timeout | null = null;
   private runtimeTailRealtimePollTimer: NodeJS.Timeout | null = null;
   private readonly runtimeTailUpdatedAtByLaunchKey = new Map<string, number>();
+  private readonly codexRolloutLiveMirror: CodexRolloutLiveMirrorController;
   private threadMirrorPollInFlight = false;
 
   constructor() {
@@ -191,10 +203,18 @@ export class BridgeServer {
     }
     this.defaultBackendId = codex.summary.id;
     const openAI = new OpenAIVoiceProvider();
+    const nvidia = new NvidiaAIVoiceProvider();
     const personaPlex = new PersonaPlexVoiceProvider();
     this.voiceProviders.set(openAI.summary.id, openAI);
+    this.voiceProviders.set(nvidia.summary.id, nvidia);
     this.voiceProviders.set(personaPlex.summary.id, personaPlex);
     this.defaultVoiceProviderId = this.resolveDefaultVoiceProviderId();
+    this.codexRolloutLiveMirror = createCodexRolloutLiveMirrorController({
+      resolveRolloutPath: (threadId) => resolveCodexThreadRolloutPath(threadId),
+      onRolloutChanged: (change) => this.publishCodexRolloutMirrorDetail(change),
+      idleTimeoutMs: BridgeServer.THREAD_MIRROR_RECENT_WINDOW_MS,
+      maxMirrors: BridgeServer.THREAD_MIRROR_MAX_THREADS,
+    });
   }
 
   async start(): Promise<void> {
@@ -458,6 +478,16 @@ export class BridgeServer {
       });
     });
 
+    this.app.get("/api/command-mode", async (_req, res) => {
+      try {
+        const provider = this.voiceProviders.get(this.defaultVoiceProviderId);
+        const summary = provider ? await provider.getSummary() : null;
+        res.json(this.commandModeDriver.buildSummary(summary));
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
     this.app.get("/api/voice/providers/:providerId/bootstrap", async (req, res) => {
       try {
         const backend = this.backendForCommandRequest(req.query);
@@ -714,6 +744,7 @@ export class BridgeServer {
         });
         const cached = this.liveCachedThreadDetail(opened.threadId);
         const summary = cached ? this.threadSummaryFromDetail(cached) : this.cachedThreadSummary(opened.threadId);
+        void this.observeCodexRolloutLiveMirror(summary);
         const detail =
           cached
           ?? (summary
@@ -1111,6 +1142,7 @@ export class BridgeServer {
       spokenResponse,
       shouldResumeListening: true,
       backend: input.backend,
+      commandMode: this.commandModeDriver.buildSummary(),
       result: input.result,
     };
   }
@@ -1206,6 +1238,10 @@ export class BridgeServer {
     style: VoiceCommandRequest["style"] | string | undefined
   ): string {
     if (provider instanceof OpenAIVoiceProvider) {
+      return provider.buildInstructions(style);
+    }
+
+    if (provider instanceof NvidiaAIVoiceProvider) {
       return provider.buildInstructions(style);
     }
 
@@ -1455,6 +1491,10 @@ export class BridgeServer {
 
       const candidates = this.threadMirrorCandidates(threads);
       await Promise.all(
+        candidates.map((thread) => this.observeCodexRolloutLiveMirror(thread))
+      );
+      await this.codexRolloutLiveMirror.poll();
+      await Promise.all(
         candidates.map((thread) => this.broadcastThreadDetailForSummarySafely(thread))
       );
     } catch (error) {
@@ -1462,6 +1502,43 @@ export class BridgeServer {
       console.error(`[bridge] thread mirroring poll failed: ${message}`);
     } finally {
       this.threadMirrorPollInFlight = false;
+    }
+  }
+
+  private async observeCodexRolloutLiveMirror(summary: ThreadSummary | null): Promise<void> {
+    if (!summary) {
+      return;
+    }
+
+    try {
+      await this.codexRolloutLiveMirror.observeThread(summary);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[bridge] Codex rollout mirror observe failed for ${summary.id}: ${message}`);
+    }
+  }
+
+  private async publishCodexRolloutMirrorDetail(change: CodexRolloutMirrorChange): Promise<void> {
+    try {
+      const summary =
+        this.cachedThreadSummary(change.threadId)
+        ?? change.summary
+        ?? await this.discoverLocalCodexThreadSummary(change.threadId);
+      if (!summary) {
+        return;
+      }
+
+      const detail = await this.codexLocalThreadDetailFallback(change.threadId, summary, {
+        includeLiveRuntimeTail: true,
+      });
+      if (!detail) {
+        return;
+      }
+
+      this.publishThreadDetailIfChanged(detail);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[bridge] Codex rollout mirror publish failed for ${change.threadId}: ${message}`);
     }
   }
 
@@ -1515,7 +1592,9 @@ export class BridgeServer {
     }
 
     this.threadDetailPollRefreshAt.set(canonicalThreadId, Date.now());
-    this.publishThreadDetailIfChanged(detail);
+    this.publishThreadDetailIfChanged(
+      await this.detailWithPreferredCodexRolloutFallback(canonicalThreadId, summary, detail)
+    );
   }
 
   private shouldRefreshPolledThreadDetail(
@@ -1525,8 +1604,13 @@ export class BridgeServer {
   ): boolean {
     const lastRefreshAt = this.threadDetailPollRefreshAt.get(threadId) ?? 0;
     const hasNonLiveTurn = cached.turns.some((turn) => turn.id !== `live-tail-${threadId}`);
+    const cachedStatus = cached.status.trim().toLowerCase();
+    const cachedLooksActive =
+      cachedStatus === "running"
+      || cachedStatus === "waitingapproval"
+      || cachedStatus === "blocked";
     const refreshInterval =
-      summary.status === "running" || !hasNonLiveTurn
+      summary.status === "running" || cachedLooksActive || !hasNonLiveTurn
         ? BridgeServer.THREAD_DETAIL_ACTIVE_POLL_REFRESH_INTERVAL_MS
         : BridgeServer.THREAD_DETAIL_POLL_REFRESH_INTERVAL_MS;
     if (Date.now() - lastRefreshAt < refreshInterval) {
@@ -1541,7 +1625,18 @@ export class BridgeServer {
       return true;
     }
 
-    return summary.status === "running";
+    if (summary.status === "running" || cachedLooksActive) {
+      return true;
+    }
+
+    if (
+      summary.backendId === "codex"
+      && Date.now() - Math.max(summary.updatedAt, cached.updatedAt) <= BridgeServer.THREAD_MIRROR_RECENT_WINDOW_MS
+    ) {
+      return true;
+    }
+
+    return false;
   }
 
   private async broadcastThreadDetailForSummarySafely(summary: ThreadSummary): Promise<void> {
@@ -1585,7 +1680,31 @@ export class BridgeServer {
     }
 
     this.threadDetailPollRefreshAt.set(canonicalThreadId, Date.now());
-    this.publishThreadDetailIfChanged(detail);
+    const summary = this.threadSummaryFromDetail(detail);
+    this.publishThreadDetailIfChanged(
+      await this.detailWithPreferredCodexRolloutFallback(canonicalThreadId, summary, detail)
+    );
+  }
+
+  private async detailWithPreferredCodexRolloutFallback(
+    threadId: string,
+    summary: ThreadSummary,
+    detail: ThreadDetail
+  ): Promise<ThreadDetail> {
+    if (summary.backendId !== "codex" && summary.backendKind !== "codex") {
+      return detail;
+    }
+
+    const localFallback = await this.codexLocalThreadDetailFallback(threadId, summary, {
+      includeLiveRuntimeTail: true,
+    });
+    if (!localFallback) {
+      return detail;
+    }
+
+    return BridgeServer.shouldPreferFallbackThreadDetail(detail, localFallback)
+      ? localFallback
+      : detail;
   }
 
   private scheduleRuntimeTailThreadDetailRefresh(threadId: string): void {
@@ -1887,16 +2006,24 @@ export class BridgeServer {
         thread,
         index,
         cachedDetail: this.liveCachedThreadDetail(thread.id),
+        shouldFetchDetail:
+          index < BridgeServer.THREAD_LIST_ENRICH_LIMIT
+          || this.threadSummaryNeedsOpportunisticDetailRefresh(thread),
       }))
-      .filter(({ thread, cachedDetail }) => cachedDetail || this.threadSummaryNeedsOpportunisticDetailRefresh(thread))
+      .filter(({ cachedDetail, shouldFetchDetail }) => (
+        cachedDetail
+        || shouldFetchDetail
+      ))
       .slice(0, BridgeServer.THREAD_LIST_ENRICH_LIMIT);
 
     await Promise.all(
-      candidates.map(async ({ thread, index, cachedDetail }) => {
+      candidates.map(async ({ thread, index, cachedDetail, shouldFetchDetail }) => {
         const detail = cachedDetail;
         if (!detail) {
-          if (this.threadSummaryNeedsOpportunisticDetailRefresh(thread)) {
-            const fetchedDetail = await this.readNormalizedThreadDetail(thread.id, thread);
+          if (shouldFetchDetail) {
+            const fetchedDetail = await this.readNormalizedThreadDetailForResponse(thread.id, {
+              summary: thread,
+            });
             if (fetchedDetail) {
               enriched[index] = await this.enrichThreadSummaryWithDetail(thread, fetchedDetail);
               return;
@@ -1924,7 +2051,22 @@ export class BridgeServer {
       return true;
     }
 
-    return preview === name;
+    if (preview === name) {
+      return true;
+    }
+
+    const normalizedStatus = thread.status.trim().toLowerCase();
+    if (
+      normalizedStatus === "running"
+      || normalizedStatus === "blocked"
+      || normalizedStatus === "waitingapproval"
+      || thread.controller != null
+    ) {
+      return true;
+    }
+
+    const ageMS = Math.max(0, Date.now() - this.normalizeThreadUpdatedAt(thread.updatedAt));
+    return ageMS <= BridgeServer.THREAD_ACTIVE_DISCOVERY_GRACE_MS;
   }
 
   private async promoteLiveArchivedCodexThreads(threads: ThreadSummary[]): Promise<ThreadSummary[]> {
@@ -2043,13 +2185,18 @@ export class BridgeServer {
     options: {
       includeLiveRuntimeTail?: boolean;
       preferFresh?: boolean;
+      summary?: ThreadSummary | null;
     } = {}
   ): Promise<ThreadDetail | null> {
     const cached = this.liveCachedThreadDetail(threadId);
-    const summary = cached
-      ? this.threadSummaryFromDetail(cached)
-      : this.cachedThreadSummary(threadId)
-        ?? await this.discoverLocalCodexThreadSummary(threadId);
+    const summary = options.summary
+      ?? (
+        cached
+          ? this.threadSummaryFromDetail(cached)
+          : this.cachedThreadSummary(threadId)
+            ?? await this.discoverLocalCodexThreadSummary(threadId)
+      );
+    void this.observeCodexRolloutLiveMirror(summary);
     const fallbackPromise = this.fallbackThreadDetailForResponse(threadId, summary, options, cached);
     const read = this.readNormalizedThreadDetailCoalesced(
       threadId,
@@ -2101,12 +2248,91 @@ export class BridgeServer {
     detail: ThreadDetail,
     fallback: ThreadDetail
   ): boolean {
-    return BridgeServer.materialThreadTurnCount(detail) == 0
-      && BridgeServer.materialThreadTurnCount(fallback) > 0;
+    if (
+      fallback.updatedAt > detail.updatedAt
+      && BridgeServer.detailHasNewMaterial(detail, fallback)
+    ) {
+      return true;
+    }
+
+    const detailMetrics = BridgeServer.materialThreadMetrics(detail);
+    const fallbackMetrics = BridgeServer.materialThreadMetrics(fallback);
+    if (fallbackMetrics.turnCount !== detailMetrics.turnCount) {
+      return fallbackMetrics.turnCount > detailMetrics.turnCount;
+    }
+    if (fallbackMetrics.itemCount !== detailMetrics.itemCount) {
+      return fallbackMetrics.itemCount > detailMetrics.itemCount;
+    }
+    return fallback.updatedAt > detail.updatedAt;
   }
 
-  private static materialThreadTurnCount(detail: ThreadDetail): number {
-    return detail.turns.filter((turn) => !turn.id.startsWith("live-tail-")).length;
+  private mergedFallbackThreadDetail(
+    cached: ThreadDetail,
+    fallback: ThreadDetail
+  ): ThreadDetail {
+    if (cached.id !== fallback.id) {
+      return fallback;
+    }
+
+    const seenTurnIDs = new Set<string>();
+    const mergedTurns: ThreadDetailTurn[] = [];
+
+    for (const fallbackTurn of fallback.turns) {
+      seenTurnIDs.add(fallbackTurn.id);
+      mergedTurns.push(fallbackTurn);
+    }
+
+    for (const cachedTurn of cached.turns) {
+      if (seenTurnIDs.has(cachedTurn.id)) {
+        continue;
+      }
+      if (cachedTurn.id.startsWith("live-tail-")) {
+        continue;
+      }
+      mergedTurns.push(cachedTurn);
+    }
+
+    return {
+      ...fallback,
+      updatedAt: Math.max(cached.updatedAt, fallback.updatedAt),
+      turns: this.trimThreadTurns(mergedTurns),
+    };
+  }
+
+  private static detailHasNewMaterial(
+    detail: ThreadDetail,
+    fallback: ThreadDetail
+  ): boolean {
+    const existingIdentities = new Set(BridgeServer.materialItemIdentities(detail));
+    return BridgeServer.materialItemIdentities(fallback)
+      .some((identity) => !existingIdentities.has(identity));
+  }
+
+  private static materialItemIdentities(detail: ThreadDetail): string[] {
+    return detail.turns
+      .filter((turn) => !turn.id.startsWith("live-tail-"))
+      .flatMap((turn) => turn.items.map((item) => BridgeServer.materialItemIdentity(item)));
+  }
+
+  private static materialItemIdentity(item: ThreadDetailItem): string {
+    const text = item.rawText ?? item.detail ?? "";
+    return [
+      item.id,
+      item.type,
+      item.title ?? "",
+      text,
+    ].join("\u{1f}");
+  }
+
+  private static materialThreadMetrics(detail: ThreadDetail): {
+    turnCount: number;
+    itemCount: number;
+  } {
+    const materialTurns = detail.turns.filter((turn) => !turn.id.startsWith("live-tail-"));
+    return {
+      turnCount: materialTurns.length,
+      itemCount: materialTurns.reduce((sum, turn) => sum + turn.items.length, 0),
+    };
   }
 
   private async fallbackThreadDetailForResponse(
@@ -2117,15 +2343,17 @@ export class BridgeServer {
     } = {},
     cached: ThreadDetail | null = null
   ): Promise<ThreadDetail | null> {
-    if (cached && BridgeServer.materialThreadTurnCount(cached) > 0) {
-      return cached;
-    }
-
     if (!summary) {
       return cached;
     }
 
     const localFallback = await this.codexLocalThreadDetailFallback(threadId, summary, options);
+    if (cached && localFallback) {
+      const mergedFallback = this.mergedFallbackThreadDetail(cached, localFallback);
+      return BridgeServer.shouldPreferFallbackThreadDetail(cached, mergedFallback)
+        ? mergedFallback
+        : cached;
+    }
     if (localFallback) {
       return localFallback;
     }
@@ -2228,10 +2456,17 @@ export class BridgeServer {
       return null;
     }
 
-    const localTurns = await this.codexLocalThreadTurns(threadId);
+    const localSnapshot = await this.codexLocalThreadSnapshot(threadId);
+    const localTurns = localSnapshot.turns.length > 0
+      ? localSnapshot.turns
+      : await this.codexLocalThreadTurns(threadId);
     if (localTurns.length === 0) {
       return null;
     }
+    const updatedAt = Math.max(
+      this.normalizeThreadUpdatedAt(summary.updatedAt),
+      localSnapshot.updatedAt ?? 0
+    );
 
     const detail = this.normalizeThreadDetail(
       {
@@ -2241,7 +2476,7 @@ export class BridgeServer {
           preview: summary.preview,
           cwd: summary.cwd,
           status: summary.status,
-          updatedAt: this.normalizeThreadUpdatedAt(summary.updatedAt),
+          updatedAt,
           sourceKind: summary.sourceKind,
           launchSource: summary.launchSource ?? null,
           turns: localTurns,
@@ -2263,6 +2498,10 @@ export class BridgeServer {
     return options.includeLiveRuntimeTail
       ? this.withLiveRuntimeTail(detailWithWorkspace, backend.summary.id)
       : detailWithWorkspace;
+  }
+
+  private async codexLocalThreadSnapshot(threadId: string): Promise<CodexThreadLocalSnapshot> {
+    return await readCodexThreadLocalSnapshot(threadId);
   }
 
   private async codexLocalThreadTurns(threadId: string): Promise<JSONValue[]> {
@@ -2836,7 +3075,7 @@ export class BridgeServer {
           .filter((turn): turn is ThreadDetailTurn => turn !== null)
       : [];
 
-    const trimmedTurns = this.trimThreadTurns(turns);
+    const trimmedTurns = this.trimThreadTurns(this.withTurnFileChangeSummaries(turns));
 
     const updatedAt = this.normalizeThreadUpdatedAt(
       typeof thread.updatedAt === "number" ? thread.updatedAt : summary?.updatedAt ?? 0
@@ -2883,6 +3122,157 @@ export class BridgeServer {
       return status.type === "active" ? "running" : status.type;
     }
     return null;
+  }
+
+  private withTurnFileChangeSummaries(turns: ThreadDetailTurn[]): ThreadDetailTurn[] {
+    return turns.map((turn) => {
+      if (turn.items.some((item) => item.id === this.turnFileChangeSummaryItemId(turn.id))) {
+        return turn;
+      }
+
+      const fileChangeItems = turn.items.filter((item) =>
+        item.type === "fileChange" && Boolean(item.rawText ?? item.detail)
+      );
+      if (fileChangeItems.length === 0) {
+        return turn;
+      }
+
+      const lastFileChangeIndex = turn.items.reduce(
+        (latestIndex, item, index) => item.type === "fileChange" ? index : latestIndex,
+        -1
+      );
+      if (lastFileChangeIndex === turn.items.length - 1) {
+        return turn;
+      }
+
+      const summaryItem = this.turnFileChangeSummaryItem(turn.id, fileChangeItems);
+      if (!summaryItem) {
+        return turn;
+      }
+
+      return {
+        ...turn,
+        items: [...turn.items, summaryItem],
+      };
+    });
+  }
+
+  private turnFileChangeSummaryItem(
+    turnId: string,
+    fileChangeItems: ThreadDetailItem[]
+  ): ThreadDetailItem | null {
+    const rawText = fileChangeItems
+      .map((item) => item.rawText ?? item.detail ?? item.title)
+      .filter((text): text is string => Boolean(text?.trim()))
+      .join("\n\n");
+    if (!rawText) {
+      return null;
+    }
+
+    const paths = this.fileChangeSummaryPaths(fileChangeItems);
+    const changeCount = paths.length > 0 ? paths.length : fileChangeItems.length;
+    const title = `${changeCount} file${changeCount === 1 ? "" : "s"} changed`;
+    const kindSummary = this.fileChangeSummaryKinds(fileChangeItems);
+    const pathSummary = this.fileChangeSummaryPathPreview(paths);
+    const detail = [title, kindSummary, pathSummary]
+      .filter((part): part is string => Boolean(part))
+      .join(" | ");
+
+    return {
+      id: this.turnFileChangeSummaryItemId(turnId),
+      turnId,
+      type: "fileChange",
+      title,
+      detail,
+      status: "completed",
+      rawText,
+      metadataSummary: `${changeCount} change${changeCount === 1 ? "" : "s"} recorded`,
+      command: null,
+      cwd: null,
+      exitCode: null,
+    };
+  }
+
+  private turnFileChangeSummaryItemId(turnId: string): string {
+    return `turn-file-change-summary-${turnId}`;
+  }
+
+  private fileChangeSummaryPaths(fileChangeItems: ThreadDetailItem[]): string[] {
+    const paths = new Set<string>();
+    for (const item of fileChangeItems) {
+      const text = [item.rawText, item.detail]
+        .filter((entry): entry is string => Boolean(entry))
+        .join("\n");
+      for (const path of this.fileChangePathsFromText(text)) {
+        paths.add(path);
+      }
+    }
+    return Array.from(paths);
+  }
+
+  private fileChangePathsFromText(text: string): string[] {
+    const paths: string[] = [];
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      const gitDiffMatch = /^diff --git a\/(.+?) b\//.exec(trimmed);
+      if (gitDiffMatch?.[1]) {
+        paths.push(gitDiffMatch[1]);
+        continue;
+      }
+
+      const headlineMatch = /^(?:added|created|deleted|modified|removed|renamed|updated)\s+(.+)$/i.exec(trimmed);
+      if (headlineMatch?.[1]) {
+        paths.push(headlineMatch[1]);
+      }
+    }
+    return paths;
+  }
+
+  private fileChangeSummaryKinds(fileChangeItems: ThreadDetailItem[]): string | null {
+    const seenKindPaths = new Set<string>();
+    const kindCounts = new Map<string, number>();
+    for (const item of fileChangeItems) {
+      for (const change of this.fileChangeKindPathPairsFromText(item.rawText ?? item.detail ?? "")) {
+        const label = this.humanizeChangeKind(change.kind);
+        const identity = `${label}\u0000${change.path}`;
+        if (seenKindPaths.has(identity)) {
+          continue;
+        }
+        seenKindPaths.add(identity);
+        kindCounts.set(label, (kindCounts.get(label) ?? 0) + 1);
+      }
+    }
+
+    const summary = Array.from(kindCounts.entries())
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 3)
+      .map(([kind, count]) => `${count} ${kind}`)
+      .join(", ");
+    return summary || null;
+  }
+
+  private fileChangeKindPathPairsFromText(text: string): Array<{ kind: string; path: string }> {
+    const changes: Array<{ kind: string; path: string }> = [];
+    for (const line of text.split(/\r?\n/)) {
+      const match = /^(added|created|deleted|modified|removed|renamed|updated)\s+(.+)$/i.exec(line.trim());
+      if (match?.[1] && match[2]) {
+        changes.push({
+          kind: match[1],
+          path: match[2],
+        });
+      }
+    }
+    return changes;
+  }
+
+  private fileChangeSummaryPathPreview(paths: string[]): string | null {
+    if (paths.length === 0) {
+      return null;
+    }
+
+    const preview = paths.slice(0, 3).join(", ");
+    const remainder = paths.length > 3 ? ` +${paths.length - 3} more` : "";
+    return `${preview}${remainder}`;
   }
 
   private withLiveRuntimeTail(detail: ThreadDetail, backendId: string): ThreadDetail {
@@ -3099,7 +3489,9 @@ export class BridgeServer {
           id,
           turnId: null,
           type,
-          title: "Plan",
+          title: typeof value.title === "string" && value.title.trim().length > 0
+            ? value.title.trim()
+            : "Plan",
           detail: typeof value.text === "string" ? value.text : null,
           status: null,
           rawText: typeof value.text === "string" ? value.text : null,
@@ -3312,7 +3704,7 @@ export class BridgeServer {
     const selected: ThreadDetailTurn[] = [];
     let itemCount = 0;
 
-    for (const turn of [...turns].reverse()) {
+    for (const turn of turns) {
       const nextItemCount = itemCount + turn.items.length;
       if (
         selected.length >= maxTurns
@@ -3325,7 +3717,7 @@ export class BridgeServer {
       itemCount = nextItemCount;
     }
 
-    return selected.reverse();
+    return selected;
   }
 
   private compactThreadDetailTurns(turns: ThreadDetailTurn[]): ThreadDetailTurn[] {
@@ -3346,11 +3738,28 @@ export class BridgeServer {
   }
 
   private compactThreadDetailForWebSocket(detail: ThreadDetail): ThreadDetail {
-    const selectedTurns = this.selectRecentThreadTurns(
-      this.compactOversizedThreadTurns(detail.turns),
-      BridgeServer.THREAD_DETAIL_WS_MAX_TURNS,
-      BridgeServer.THREAD_DETAIL_WS_MAX_ITEMS
-    );
+    const budgetedTurns = this.compactOversizedThreadTurns(detail.turns);
+    const liveTailTurns = budgetedTurns.filter((turn) => turn.id.startsWith("live-tail-"));
+    const selectedTurns = (() => {
+      if (liveTailTurns.length === 0) {
+        return this.selectRecentThreadTurns(
+          budgetedTurns,
+          BridgeServer.THREAD_DETAIL_WS_MAX_TURNS,
+          BridgeServer.THREAD_DETAIL_WS_MAX_ITEMS
+        );
+      }
+
+      const liveTailIDs = new Set(liveTailTurns.map((turn) => turn.id));
+      const remainingTurns = budgetedTurns.filter((turn) => !liveTailIDs.has(turn.id));
+      const liveTailItemCount = liveTailTurns.reduce((sum, turn) => sum + turn.items.length, 0);
+      const selectedRemainingTurns = this.selectRecentThreadTurns(
+        remainingTurns,
+        Math.max(1, BridgeServer.THREAD_DETAIL_WS_MAX_TURNS - liveTailTurns.length),
+        Math.max(1, BridgeServer.THREAD_DETAIL_WS_MAX_ITEMS - liveTailItemCount)
+      );
+
+      return [...selectedRemainingTurns, ...liveTailTurns];
+    })();
 
     return {
       ...detail,
@@ -3424,7 +3833,7 @@ export class BridgeServer {
   private threadPreviewFromDetail(detail: ThreadDetail): string {
     const snippets: string[] = [];
 
-    for (const turn of [...detail.turns].reverse()) {
+    for (const turn of detail.turns) {
       for (const item of [...turn.items].reverse()) {
         if (item.type !== "userMessage" && item.type !== "agentMessage") {
           continue;
@@ -3487,36 +3896,7 @@ export class BridgeServer {
     fallbackPreview: string | null = null,
     fallbackName: string | null = null
   ): string {
-    const trimmedFallback = this.previewText(fallbackPreview);
-    if (this.shouldPreserveStableThreadPreview(status, trimmedFallback, fallbackName)) {
-      return trimmedFallback;
-    }
-
     return this.resolvedThreadPreview(primaryPreview, status, fallbackPreview, fallbackName);
-  }
-
-  private shouldPreserveStableThreadPreview(
-    status: string,
-    fallbackPreview: string,
-    fallbackName: string | null = null
-  ): boolean {
-    if (!fallbackPreview || this.isGenericThreadPreview(fallbackPreview)) {
-      return false;
-    }
-
-    const trimmedName = this.previewText(fallbackName);
-    if (trimmedName && trimmedName === fallbackPreview) {
-      return false;
-    }
-
-    switch (status.trim().toLowerCase()) {
-    case "running":
-    case "blocked":
-    case "waitingapproval":
-      return false;
-    default:
-      return true;
-    }
   }
 
   private isGenericThreadPreview(preview: string): boolean {

@@ -68,7 +68,7 @@ if (!version || !owner || !repo || !sha256) {
   process.exit(2);
 }
 
-const tarballURL = sourceURL || `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/tags/v${version}`;
+const tarballURL = sourceURL || `https://github.com/${owner}/${repo}/archive/refs/tags/v${version}.tar.gz`;
 
 function renderHomebrewLicense(rawLicense) {
   if (typeof rawLicense !== "string" || rawLicense.trim() === "" || rawLicense === "UNLICENSED") {

@@ -6,6 +6,7 @@ import path from "node:path";
 
 import {
   codexThreadPreviewForDisplay,
+  parseCodexRolloutUpdatedAt,
   parseCodexRolloutTurns,
   preferredCodexThreadName,
   readCodexRolloutTailText,
@@ -14,6 +15,13 @@ import {
 function rolloutLine(payload: Record<string, unknown>): string {
   return JSON.stringify({
     type: "event_msg",
+    payload,
+  });
+}
+
+function responseLine(payload: Record<string, unknown>): string {
+  return JSON.stringify({
+    type: "response_item",
     payload,
   });
 }
@@ -116,6 +124,42 @@ test("local rollout fallback emits called MCP tool calls", () => {
   assert.equal(item?.contentItems, "projectPath: ios/Helm.xcodeproj");
 });
 
+test("local rollout fallback emits update plan task items", () => {
+  const turns = parseCodexRolloutTurns(
+    [
+      rolloutLine({ type: "task_started", turn_id: "turn-1" }),
+      responseLine({
+        type: "function_call",
+        name: "update_plan",
+        arguments: JSON.stringify({
+          explanation: "Working through the visible task list.",
+          plan: [
+            { step: "Save parity plan", status: "completed" },
+            { step: "Run replay coverage", status: "in_progress" },
+            { step: "Verify final status", status: "pending" },
+          ],
+        }),
+      }),
+    ].join("\n"),
+    "thread-1"
+  );
+
+  const turn = turns[0] as { items?: Array<{ type?: string; title?: string; text?: string; metadataSummary?: string }> } | undefined;
+  const item = turn?.items?.[0];
+  assert.equal(item?.type, "plan");
+  assert.equal(item?.title, "1 out of 3 tasks completed");
+  assert.equal(
+    item?.text,
+    [
+      "1 out of 3 tasks completed",
+      "✓ Save parity plan",
+      "◉ Run replay coverage",
+      "□ Verify final status",
+    ].join("\n")
+  );
+  assert.equal(item?.metadataSummary, "Working through the visible task list.");
+});
+
 test("local rollout fallback orders turns by most recent activity", () => {
   const turns = parseCodexRolloutTurns(
     [
@@ -140,6 +184,172 @@ test("local rollout fallback orders turns by most recent activity", () => {
   assert.equal(turns[0]?.items.at(-1)?.text, "final assistant message");
   assert.equal(turns[1]?.items[0]?.type, "commandExecution");
   assert.equal(turns[1]?.items[0]?.command, "git status --short");
+});
+
+test("local rollout fallback emits assistant response item messages", () => {
+  const turns = parseCodexRolloutTurns(
+    [
+      rolloutLine({ type: "task_started", turn_id: "turn-1" }),
+      rolloutLine({
+        type: "exec_command_end",
+        turn_id: "turn-1",
+        command: "git status --short",
+        status: "completed",
+        exit_code: 0,
+      }),
+      responseLine({
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            text: "final assistant response from response item",
+          },
+        ],
+      }),
+      rolloutLine({ type: "task_complete", turn_id: "turn-1" }),
+    ].join("\n"),
+    "thread-1"
+  ) as Array<{ id: string; items: Array<{ type?: string; text?: string; command?: string }> }>;
+
+  assert.equal(turns[0]?.id, "turn-1");
+  assert.equal(turns[0]?.items.at(-1)?.type, "agentMessage");
+  assert.equal(turns[0]?.items.at(-1)?.text, "final assistant response from response item");
+});
+
+test("local rollout fallback ignores response input messages", () => {
+  const turns = parseCodexRolloutTurns(
+    [
+      responseLine({
+        type: "message",
+        content: [
+          {
+            type: "input_text",
+            text: "<collaboration_mode>internal context</collaboration_mode>",
+          },
+        ],
+      }),
+      rolloutLine({ type: "user_message", message: "actual user text" }),
+    ].join("\n"),
+    "thread-1"
+  ) as Array<{ items: Array<{ type?: string; content?: { text?: string } }> }>;
+
+  assert.deepEqual(
+    turns[0]?.items.map((item) => item.content?.text),
+    ["actual user text"]
+  );
+});
+
+test("local rollout fallback deduplicates paired event and response messages", () => {
+  const turns = parseCodexRolloutTurns(
+    [
+      rolloutLine({ type: "task_started", turn_id: "turn-1" }),
+      rolloutLine({
+        type: "agent_message",
+        turn_id: "turn-1",
+        message: "same assistant response",
+      }),
+      responseLine({
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            text: [
+              "same assistant response",
+              "",
+              "<oai-mem-citation>",
+              "<citation_entries>",
+              "MEMORY.md:1-2|note=[context]",
+              "</citation_entries>",
+              "<rollout_ids>",
+              "</rollout_ids>",
+              "</oai-mem-citation>",
+            ].join("\n"),
+          },
+        ],
+      }),
+      rolloutLine({ type: "task_complete", turn_id: "turn-1" }),
+    ].join("\n"),
+    "thread-1"
+  ) as Array<{ id: string; items: Array<{ type?: string; text?: string }> }>;
+
+  assert.deepEqual(
+    turns[0]?.items.map((item) => item.text),
+    ["same assistant response"]
+  );
+});
+
+test("local rollout fallback attaches unscoped final answers to completed turn", () => {
+  const turns = parseCodexRolloutTurns(
+    [
+      rolloutLine({
+        type: "exec_command_end",
+        turn_id: "turn-1",
+        command: "npm test",
+        status: "completed",
+        aggregated_output: "tests passed",
+      }),
+      rolloutLine({
+        type: "agent_message",
+        message: "final answer text",
+        phase: "final_answer",
+      }),
+      responseLine({
+        type: "message",
+        phase: "final_answer",
+        content: [
+          {
+            type: "output_text",
+            text: [
+              "final answer text",
+              "",
+              "<oai-mem-citation>",
+              "<citation_entries>",
+              "MEMORY.md:1-2|note=[context]",
+              "</citation_entries>",
+              "<rollout_ids>",
+              "</rollout_ids>",
+              "</oai-mem-citation>",
+            ].join("\n"),
+          },
+        ],
+      }),
+      rolloutLine({
+        type: "task_complete",
+        turn_id: "turn-1",
+        last_agent_message: "final answer text",
+      }),
+    ].join("\n"),
+    "thread-1"
+  ) as Array<{ id: string; items: Array<{ type?: string; text?: string }> }>;
+
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]?.id, "turn-1");
+  assert.deepEqual(
+    turns[0]?.items
+      .filter((item) => item.type === "agentMessage")
+      .map((item) => item.text),
+    ["final answer text"]
+  );
+});
+
+test("local rollout fallback derives freshness from rollout timestamps", () => {
+  assert.equal(
+    parseCodexRolloutUpdatedAt(
+      [
+        JSON.stringify({
+          timestamp: "2026-04-23T20:54:44.546Z",
+          type: "event_msg",
+          payload: { type: "task_started" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-23T20:57:20.200Z",
+          type: "event_msg",
+          payload: { type: "mcp_tool_call_end" },
+        }),
+      ].join("\n")
+    ),
+    Date.parse("2026-04-23T20:57:20.200Z")
+  );
 });
 
 test("preferredCodexThreadName ignores degraded Helm app titles", () => {

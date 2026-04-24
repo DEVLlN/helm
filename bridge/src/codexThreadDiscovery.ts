@@ -55,6 +55,11 @@ export type ResolvedCodexThreadName =
       status: "notFound";
     };
 
+export type CodexThreadLocalSnapshot = {
+  turns: JSONValue[];
+  updatedAt: number | null;
+};
+
 function codexStatePath(): string {
   return path.join(homedir(), ".codex", "state_5.sqlite");
 }
@@ -230,6 +235,10 @@ export async function discoverCodexThread(threadId: string): Promise<ThreadSumma
 }
 
 export async function readCodexThreadLocalTurns(threadId: string): Promise<JSONValue[]> {
+  return (await readCodexThreadLocalSnapshot(threadId)).turns;
+}
+
+export async function readCodexThreadLocalSnapshot(threadId: string): Promise<CodexThreadLocalSnapshot> {
   const row = await queryCodexThreadRow(threadId, `
     select
       id,
@@ -241,14 +250,18 @@ export async function readCodexThreadLocalTurns(threadId: string): Promise<JSONV
   `);
   const rolloutPath = resolveCodexRolloutPath(threadId, row?.rollout_path);
   if (!rolloutPath) {
-    return [];
+    return { turns: [], updatedAt: null };
   }
 
   try {
-    return parseCodexRolloutTurns(readCodexRolloutTailText(rolloutPath), threadId);
+    const content = readCodexRolloutTailText(rolloutPath);
+    return {
+      turns: parseCodexRolloutTurns(content, threadId),
+      updatedAt: parseCodexRolloutUpdatedAt(content),
+    };
   } catch (error) {
     console.warn(`[bridge] failed to read local Codex rollout ${rolloutPath}: ${errorMessage(error)}`);
-    return [];
+    return { turns: [], updatedAt: null };
   }
 }
 
@@ -400,6 +413,7 @@ function resolveCodexRolloutPath(
 export function parseCodexRolloutTurns(content: string, threadId: string): JSONValue[] {
   const turns = new Map<string, { id: string; status: string; items: JSONValue[]; lastTouchedIndex: number }>();
   let currentTurnId = `local-rollout-${threadId}`;
+  let pendingUnscopedFinalItems: JSONValue[] = [];
 
   const getTurn = (turnId: string, lastTouchedIndex: number) => {
     let turn = turns.get(turnId);
@@ -412,7 +426,20 @@ export function parseCodexRolloutTurns(content: string, threadId: string): JSONV
     return turn;
   };
 
-  for (const [index, line] of content.split(/\r?\n/).entries()) {
+  const appendPendingFinalItems = (turnId: string, lastTouchedIndex: number) => {
+    if (pendingUnscopedFinalItems.length === 0) {
+      return;
+    }
+
+    const turn = getTurn(turnId, lastTouchedIndex);
+    for (const item of pendingUnscopedFinalItems) {
+      appendLocalRolloutItem(turn, item);
+    }
+    pendingUnscopedFinalItems = [];
+  };
+
+  const lines = content.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
     if (!trimmed) {
       continue;
@@ -426,6 +453,7 @@ export function parseCodexRolloutTurns(content: string, threadId: string): JSONV
     }
 
     if (record.type === "event_msg" && payloadType === "task_started") {
+      appendPendingFinalItems(currentTurnId, index);
       currentTurnId = stringValue(payload.turn_id) ?? currentTurnId;
       getTurn(currentTurnId, index).status = "running";
       continue;
@@ -433,16 +461,29 @@ export function parseCodexRolloutTurns(content: string, threadId: string): JSONV
 
     const turnId = stringValue(payload.turn_id) ?? currentTurnId;
     if (record.type === "event_msg" && payloadType === "task_complete") {
-      getTurn(turnId, index).status = "completed";
+      const turn = getTurn(turnId, index);
+      appendPendingFinalItems(turnId, index);
+      const completeItem = taskCompleteRolloutItem(payload, index + 1);
+      if (completeItem) {
+        appendLocalRolloutItem(turn, completeItem);
+      }
+      turn.status = "completed";
       currentTurnId = `local-rollout-${threadId}`;
       continue;
     }
 
     const item = localRolloutItem(record.type, payloadType, payload, index + 1);
     if (item) {
-      getTurn(turnId, index).items.push(item);
+      if (isUnscopedFinalAnswerMessage(record.type, payloadType, payload)) {
+        pendingUnscopedFinalItems.push(item);
+        continue;
+      }
+
+      appendLocalRolloutItem(getTurn(turnId, index), item);
     }
   }
+
+  appendPendingFinalItems(currentTurnId, lines.length);
 
   return Array.from(turns.values())
     .filter((turn) => turn.items.length > 0)
@@ -454,12 +495,79 @@ export function parseCodexRolloutTurns(content: string, threadId: string): JSONV
     }));
 }
 
+export function parseCodexRolloutUpdatedAt(content: string): number | null {
+  let updatedAt: number | null = null;
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const record = parseJSONObject(trimmed);
+    const timestamp = stringValue(record?.timestamp);
+    if (!timestamp) {
+      continue;
+    }
+
+    const time = Date.parse(timestamp);
+    if (!Number.isFinite(time)) {
+      continue;
+    }
+
+    updatedAt = Math.max(updatedAt ?? 0, time);
+  }
+
+  return updatedAt;
+}
+
+function taskCompleteRolloutItem(
+  payload: { [key: string]: JSONValue },
+  index: number
+): JSONValue | null {
+  const text = boundedTailText(stripMemoryCitationBlock(stringValue(payload.last_agent_message) ?? ""));
+  return text
+    ? {
+        id: `local-agent-complete-${index}`,
+        type: "agentMessage",
+        text,
+        phase: "final_answer",
+      }
+    : null;
+}
+
+function isUnscopedFinalAnswerMessage(
+  recordType: JSONValue | undefined,
+  payloadType: string,
+  payload: { [key: string]: JSONValue }
+): boolean {
+  if (stringValue(payload.turn_id)) {
+    return false;
+  }
+  if (stringValue(payload.phase) !== "final_answer") {
+    return false;
+  }
+
+  return (
+    (recordType === "event_msg" && payloadType === "agent_message")
+    || (recordType === "response_item" && payloadType === "message")
+  );
+}
+
 function localRolloutItem(
   recordType: JSONValue | undefined,
   payloadType: string,
   payload: { [key: string]: JSONValue },
   index: number
 ): JSONValue | null {
+  if (recordType === "response_item") {
+    if (payloadType === "message") {
+      return responseMessageRolloutItem(payload, index);
+    }
+    if (payloadType === "function_call" && stringValue(payload.name) === "update_plan") {
+      return updatePlanRolloutItem(payload, index);
+    }
+  }
+
   if (recordType !== "event_msg") {
     return null;
   }
@@ -533,6 +641,165 @@ function localRolloutItem(
     default:
       return null;
   }
+}
+
+function appendLocalRolloutItem(
+  turn: { items: JSONValue[] },
+  item: JSONValue
+): void {
+  const identity = localRolloutItemIdentity(item);
+  if (identity && turn.items.some((existing) => localRolloutItemIdentity(existing) === identity)) {
+    return;
+  }
+
+  turn.items.push(item);
+}
+
+function localRolloutItemIdentity(item: JSONValue): string | null {
+  const itemObject = objectValue(item);
+  const type = stringValue(itemObject?.type);
+  if (!itemObject || !type) {
+    return null;
+  }
+
+  switch (type) {
+    case "userMessage": {
+      const content = objectValue(itemObject.content);
+      const text = comparableRolloutText(stringValue(content?.text));
+      return text ? `user:${text}` : null;
+    }
+    case "agentMessage": {
+      const text = comparableRolloutText(stringValue(itemObject.text));
+      return text ? `agent:${text}` : null;
+    }
+    case "plan": {
+      const text = comparableRolloutText(stringValue(itemObject.text));
+      return text ? `plan:${text}` : null;
+    }
+    case "commandExecution": {
+      return [
+        "command",
+        stringValue(itemObject.command) ?? "",
+        numberValue(itemObject.exitCode)?.toString() ?? "",
+        stringValue(itemObject.aggregatedOutput) ?? "",
+      ].join(":");
+    }
+    default:
+      return null;
+  }
+}
+
+function updatePlanRolloutItem(
+  payload: { [key: string]: JSONValue },
+  index: number
+): JSONValue | null {
+  const argumentsText = stringValue(payload.arguments);
+  if (!argumentsText) {
+    return null;
+  }
+
+  const parsed = parseJSONObject(argumentsText);
+  const plan = Array.isArray(parsed?.plan) ? parsed.plan : [];
+  const lines = plan
+    .map(updatePlanTaskLine)
+    .filter((line): line is string => line !== null);
+  if (lines.length === 0) {
+    return null;
+  }
+
+  const completedCount = lines.filter((line) => line.startsWith("\u{2713} ")).length;
+  const title = `${completedCount} out of ${lines.length} task${lines.length === 1 ? "" : "s"} completed`;
+  const explanation = stringValue(parsed?.explanation);
+  const text = [title, ...lines].join("\n");
+
+  return {
+    id: `local-plan-${index}`,
+    type: "plan",
+    title,
+    text,
+    metadataSummary: explanation ? boundedHeadText(explanation) : null,
+  };
+}
+
+function updatePlanTaskLine(value: JSONValue): string | null {
+  const task = objectValue(value);
+  if (!task) {
+    return null;
+  }
+
+  const step = stringValue(task.step)?.trim();
+  if (!step) {
+    return null;
+  }
+
+  const status = stringValue(task.status)?.trim().toLowerCase();
+  switch (status) {
+    case "completed":
+      return `\u{2713} ${step}`;
+    case "in_progress":
+    case "in-progress":
+    case "active":
+      return `\u{25C9} ${step}`;
+    default:
+      return `\u{25A1} ${step}`;
+  }
+}
+
+function responseMessageRolloutItem(
+  payload: { [key: string]: JSONValue },
+  index: number
+): JSONValue | null {
+  const outputText = responseContentText(payload.content, "output_text");
+  if (outputText) {
+    return {
+      id: `local-agent-response-${index}`,
+      type: "agentMessage",
+      text: boundedTailText(outputText),
+      phase: "response_item",
+    };
+  }
+
+  return null;
+}
+
+function responseContentText(
+  value: JSONValue | undefined,
+  acceptedType: "input_text" | "output_text"
+): string | null {
+  if (typeof value === "string") {
+    return acceptedType === "output_text" ? stripMemoryCitationBlock(value) || null : null;
+  }
+
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const text = value
+    .map((entry) => {
+      const entryObject = objectValue(entry);
+      if (!entryObject || stringValue(entryObject.type) !== acceptedType) {
+        return null;
+      }
+      return stringValue(entryObject.text);
+    })
+    .filter((entry): entry is string => Boolean(entry))
+    .join("\n")
+    .trim();
+
+  return stripMemoryCitationBlock(text) || null;
+}
+
+function comparableRolloutText(value: string | null): string | null {
+  const text = stripMemoryCitationBlock(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text || null;
+}
+
+function stripMemoryCitationBlock(value: string): string {
+  return value
+    .replace(/\n?<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>\s*$/u, "")
+    .trimEnd();
 }
 
 function rolloutFileChanges(value: JSONValue | undefined): JSONValue[] {
