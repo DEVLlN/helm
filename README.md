@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/DEVLlN/helm/main/docs/brand/helm-icon-v1/helm-logo-lockup-v1-2048w.png" alt="Helm" width="420">
+</p>
+
 # Helm
 
 Helm sets up the bridge and CLI helpers that keep local Codex sessions reachable from other devices. It handles runtime detection, shell integration, bridge startup, and pairing from one command.
