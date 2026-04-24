@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/DEVLlN/helm/main/docs/brand/helm-icon-v1/helm-logo-lockup-v1-2048w.png" alt="Helm" width="420">
+  <img src="https://raw.githubusercontent.com/DEVLlN/helm/main/docs/brand/helm-icon-v1/helm-app-icon-v1-1024.png" alt="Helm app icon" width="128">
 </p>
 
 # Helm

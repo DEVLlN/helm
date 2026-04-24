@@ -20,5 +20,6 @@ Files:
 - `helm-logo-lockup-v1-4096w.png`: wordmark lockup, 4096 px wide.
 - `helm-helmet-mark-v1-1024h.png`: standalone helmet mark, 1024 px tall.
 - `helm-helmet-mark-v1-2048h.png`: standalone helmet mark, 2048 px tall.
+- `helm-github-social-preview-v1.png`: 1280x640 GitHub social-preview image derived from the selected app icon.
 
 Note: these are raster exports from the generated concept. The app icon exports use a square full-bleed crop so Apple platforms can apply their own icon mask. The lockup and standalone mark are intentionally kept on the light source background because the helmet uses white negative-space geometry.
