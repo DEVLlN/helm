@@ -9,6 +9,29 @@ import { CodexAppServerClient, currentPromptDraftFromTerminalTail } from "./code
 import { codexProjectNameForPath } from "./codexProjectNames.js";
 import type { JSONValue } from "./types.js";
 
+type TestStartTurnOptions = {
+  deliveryMode?: "queue" | "steer" | "interrupt";
+  imageAttachments?: Array<{ path: string; filename?: string; mimeType?: string }>;
+  fileAttachments?: Array<{ path: string; filename?: string; mimeType?: string }>;
+};
+
+type TestQueuedFollowUp = {
+  id: string;
+  text: string;
+  context: {
+    prompt: string;
+    addedFiles: JSONValue[];
+    fileAttachments: JSONValue[];
+    commentAttachments: JSONValue[];
+    ideContext: JSONValue | null;
+    imageAttachments: JSONValue[];
+    workspaceRoots: string[];
+    collaborationMode: JSONValue | null;
+  };
+  cwd: string | null;
+  createdAt: number;
+};
+
 type CodexClientPrivateHooks = {
   localThreadReadFallback(threadId: string, includeTurns: boolean): Promise<JSONValue | undefined>;
   applyCodexDesktopWorkspaceFocus(threads: Array<{
@@ -77,6 +100,22 @@ type CodexClientPrivateHooks = {
   shouldStartViaAppServer(threadId: string): Promise<boolean>;
   shouldPreferCLIResumeFallback(threadId: string): Promise<boolean>;
   shouldPreferShellRelayFirst(threadId: string): Promise<boolean>;
+  enqueueTurnViaCodexDesktopIpc(
+    threadId: string,
+    text: string,
+    options: TestStartTurnOptions,
+    thread: { cwd: string; sourceKind?: string | null }
+  ): Promise<JSONValue | undefined>;
+  startTurnViaCodexDesktopIpc(
+    threadId: string,
+    text: string,
+    options: TestStartTurnOptions,
+    baseline: unknown
+  ): Promise<JSONValue | undefined>;
+  codexDesktopQueuedFollowUpsWithAppendedMessage(
+    currentMessages: TestQueuedFollowUp[],
+    message: TestQueuedFollowUp
+  ): TestQueuedFollowUp[];
 };
 
 function encodeRawServerTextFrame(text: string): Buffer {
@@ -307,6 +346,90 @@ test("idle attached CLI turn delivery skips managed shell launch before app-serv
     mode: "steer",
     threadId: "thread-1",
   });
+});
+
+test("queued Codex desktop turn keeps queue mode when an image is attached", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  let queuedText: string | null = null;
+  let startTurnCalls = 0;
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "vscode",
+    status: "running",
+  });
+  hooks.readThreadDeliverySnapshot = async () => ({
+    hasTurnData: true,
+    turnCount: 3,
+    matchingUserTextCount: 0,
+    updatedAt: 123_000,
+    threadStatus: "running",
+    activeTurnId: "turn-3",
+  });
+  hooks.enqueueTurnViaCodexDesktopIpc = async (_threadId, text) => {
+    queuedText = text;
+    return {
+      ok: true,
+      mode: "codexDesktopIpcQueuedFollowUpBroadcast",
+      threadId: "thread-1",
+    };
+  };
+  hooks.startTurnViaCodexDesktopIpc = async () => {
+    startTurnCalls += 1;
+    throw new Error("queue with image must not start an immediate desktop turn");
+  };
+
+  const result = await client.startTurn("thread-1", "Use the screenshot", {
+    deliveryMode: "queue",
+    imageAttachments: [
+      {
+        path: "/tmp/helm-mobile/camera-roll-1.jpg",
+        filename: "camera-roll-1.jpg",
+        mimeType: "image/jpeg",
+      },
+    ],
+  });
+
+  assert.equal(startTurnCalls, 0);
+  assert.match(queuedText ?? "", /Use the screenshot/);
+  assert.match(queuedText ?? "", /camera-roll-1\.jpg/);
+  assert.match(queuedText ?? "", /\/tmp\/helm-mobile\/camera-roll-1\.jpg/);
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "codexDesktopIpcQueuedFollowUpBroadcast",
+    threadId: "thread-1",
+  });
+});
+
+test("Codex desktop queued follow-up append coalesces immediate duplicate messages", () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const message = (id: string, createdAt: number) => ({
+    id,
+    text: "queued from mobile",
+    context: {
+      prompt: "queued from mobile",
+      addedFiles: [],
+      fileAttachments: [],
+      commentAttachments: [],
+      ideContext: null,
+      imageAttachments: [],
+      workspaceRoots: ["/Users/devlin/GitHub/helm-dev"],
+      collaborationMode: null,
+    },
+    cwd: "/Users/devlin/GitHub/helm-dev",
+    createdAt,
+  });
+
+  const first = message("first", 1_000);
+  const duplicate = message("duplicate", 1_500);
+  const laterRepeat = message("later", 8_000);
+
+  const afterDuplicate = hooks.codexDesktopQueuedFollowUpsWithAppendedMessage([first], duplicate);
+  const afterLaterRepeat = hooks.codexDesktopQueuedFollowUpsWithAppendedMessage(afterDuplicate, laterRepeat);
+
+  assert.deepEqual(afterDuplicate.map((entry) => entry.id), ["first"]);
+  assert.deepEqual(afterLaterRepeat.map((entry) => entry.id), ["first", "later"]);
 });
 
 test("Codex CLI prompt draft extraction ignores styled placeholder text", () => {

@@ -84,6 +84,7 @@ const LOCAL_ROLLOUT_FULLER_TURN_DELTA = 1;
 const LOCAL_ROLLOUT_FULLER_ITEM_DELTA = 8;
 const CODEX_DESKTOP_CONTROLLER_ID = "codex-desktop";
 const CODEX_DESKTOP_CONTROLLER_NAME = "Codex Desktop";
+const CODEX_DESKTOP_DUPLICATE_QUEUE_WINDOW_MS = 2_500;
 
 type CodexAppServerSocket = WebSocket | CodexUnixSocketWebSocket;
 
@@ -1629,17 +1630,19 @@ export class CodexAppServerClient extends EventEmitter {
     let appServerSteerError: Error | null = null;
     let shellRelayError: Error | null = null;
     const hasImageAttachments = Boolean(options.imageAttachments?.length);
-    const shellRelayText = this.textWithImageAttachments(effectiveText, options.imageAttachments ?? []);
+    const queueSafeText = this.textWithImageAttachments(effectiveText, options.imageAttachments ?? []);
+    const shellRelayText = queueSafeText;
     let attemptedShellRelay = false;
-    const queueDeliveryRequested = options.deliveryMode === "queue" && !hasImageAttachments;
+    const queueDeliveryRequested = options.deliveryMode === "queue";
     const steerDeliveryRequested = options.deliveryMode === "steer" && !hasImageAttachments;
     const activeDeliveryRequested = queueDeliveryRequested || steerDeliveryRequested;
+    const activeDeliveryText = queueDeliveryRequested ? queueSafeText : effectiveText;
     const deliveryThread = await this.loadThreadDeliverySummary(threadId);
     const activeDeliveryThread = activeDeliveryRequested ? deliveryThread : null;
     const activeDeliveryUsesSharedDesktopSurface =
       activeDeliveryThread ? codexSourceKindUsesSharedDesktopSurface(activeDeliveryThread.sourceKind) : false;
     const activeDeliverySnapshot = activeDeliveryRequested
-      ? await this.readThreadDeliverySnapshot(threadId, effectiveText)
+      ? await this.readThreadDeliverySnapshot(threadId, activeDeliveryText)
       : null;
     const activeDeliveryLaunch = activeDeliveryRequested ? findMatchingLaunchByThreadID("codex", threadId) : null;
     const activeDeliveryHasRuntimeRelay = isRuntimeRelayAvailable(activeDeliveryLaunch);
@@ -1652,7 +1655,7 @@ export class CodexAppServerClient extends EventEmitter {
     const desktopIpcDeliveryBaseline = desktopIpcDeliveryThread
       && codexSourceKindUsesSharedDesktopSurface(desktopIpcDeliveryThread.sourceKind)
       ? activeDeliverySnapshot
-        ?? await this.readThreadDeliverySnapshot(threadId, effectiveText)
+        ?? await this.readThreadDeliverySnapshot(threadId, activeDeliveryText)
         ?? this.threadDeliverySnapshotFromSummary(desktopIpcDeliveryThread)
       : null;
     if (
@@ -1663,7 +1666,7 @@ export class CodexAppServerClient extends EventEmitter {
         if (queueDeliveryRequested) {
           return await this.enqueueTurnViaCodexDesktopIpc(
             threadId,
-            effectiveText,
+            queueSafeText,
             options,
             desktopIpcDeliveryThread
           );
@@ -1703,7 +1706,7 @@ export class CodexAppServerClient extends EventEmitter {
 
     if (activeDeliveryNeedsRunningTurnSteer && activeDeliverySnapshot && !activeDeliveryHasRuntimeRelay) {
       try {
-        const steered = await this.startTurnViaAppServerSteer(threadId, effectiveText, activeDeliverySnapshot, {
+        const steered = await this.startTurnViaAppServerSteer(threadId, activeDeliveryText, activeDeliverySnapshot, {
           swallowErrors: false,
         });
         if (steered) {
@@ -1748,7 +1751,7 @@ export class CodexAppServerClient extends EventEmitter {
       if (!attemptedShellRelay) {
         attemptedShellRelay = true;
         try {
-          const shellRelayResult = await this.startTurnViaVerifiedShellRelay(threadId, effectiveText, options);
+          const shellRelayResult = await this.startTurnViaVerifiedShellRelay(threadId, shellRelayText, options);
           if (shellRelayResult) {
             return shellRelayResult;
           }
@@ -1973,7 +1976,26 @@ export class CodexAppServerClient extends EventEmitter {
     if (currentMessages.some((currentMessage) => currentMessage.id === message.id)) {
       return currentMessages;
     }
+    const messageKey = this.codexDesktopQueuedFollowUpDeduplicationKey(message);
+    if (
+      currentMessages.some((currentMessage) =>
+        Math.abs(message.createdAt - currentMessage.createdAt) <= CODEX_DESKTOP_DUPLICATE_QUEUE_WINDOW_MS
+        && this.codexDesktopQueuedFollowUpDeduplicationKey(currentMessage) === messageKey
+      )
+    ) {
+      return currentMessages;
+    }
     return [...currentMessages, message];
+  }
+
+  private codexDesktopQueuedFollowUpDeduplicationKey(message: CodexDesktopQueuedFollowUp): string {
+    return JSON.stringify({
+      text: message.text.trim(),
+      prompt: stringValue(message.context.prompt)?.trim() ?? "",
+      cwd: message.cwd ?? "",
+      imageAttachments: message.context.imageAttachments,
+      fileAttachments: message.context.fileAttachments,
+    });
   }
 
   private async readCodexDesktopQueuedFollowUpsState(): Promise<CodexDesktopQueuedFollowUpsState> {
