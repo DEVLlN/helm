@@ -45,8 +45,16 @@ fi
 
 : "${BRIDGE_HOST:=127.0.0.1}"
 : "${BRIDGE_PORT:=8787}"
-: "${CODEX_APP_SERVER_URL:=ws://127.0.0.1:6060}"
+: "${CODEX_APP_SERVER_SOCKET:=$RUNTIME_DIR/codex-app-server.sock}"
 : "${HELM_RUNTIME_CAPTURE_FILE:=${HOME}/.config/helm/runtime-binary-capture.json}"
+
+LEGACY_CODEX_APP_SERVER_URL="ws://127.0.0.1:6060"
+if [[ -z "${CODEX_APP_SERVER_URL:-}" ]] || {
+  [[ "${CODEX_APP_SERVER_URL:-}" == "$LEGACY_CODEX_APP_SERVER_URL" ]] \
+    && [[ "${HELM_FORCE_LEGACY_CODEX_TCP:-0}" != "1" ]]
+}; then
+  CODEX_APP_SERVER_URL="unix://$CODEX_APP_SERVER_SOCKET"
+fi
 
 if command -v tailscale >/dev/null 2>&1; then
   TAILSCALE_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
@@ -65,15 +73,27 @@ if [[ "$TAILSCALE_ACTIVE" -eq 1 ]]; then
   fi
 fi
 
-export BRIDGE_HOST BRIDGE_PORT CODEX_APP_SERVER_URL
+export BRIDGE_HOST BRIDGE_PORT CODEX_APP_SERVER_URL CODEX_APP_SERVER_SOCKET
 
 if [[ "$LAN_MODE" -eq 1 ]]; then
   export BRIDGE_HOST="0.0.0.0"
 fi
 
 LOCAL_BRIDGE_URL="http://127.0.0.1:${BRIDGE_PORT}"
-APP_SERVER_HOST="$(python3 -c 'from urllib.parse import urlparse; import os; print(urlparse(os.environ["CODEX_APP_SERVER_URL"]).hostname or "127.0.0.1")')"
-APP_SERVER_PORT="$(python3 -c 'from urllib.parse import urlparse; import os; parsed=urlparse(os.environ["CODEX_APP_SERVER_URL"]); print(parsed.port or 80)')"
+APP_SERVER_SCHEME="$(python3 -c 'from urllib.parse import urlparse; import os; print(urlparse(os.environ["CODEX_APP_SERVER_URL"]).scheme)')"
+APP_SERVER_SOCKET_PATH=""
+APP_SERVER_HOST=""
+APP_SERVER_PORT=""
+if [[ "$APP_SERVER_SCHEME" == "unix" ]]; then
+  APP_SERVER_SOCKET_PATH="$(python3 -c 'from urllib.parse import urlparse; import os; parsed=urlparse(os.environ["CODEX_APP_SERVER_URL"]); print(parsed.path or parsed.netloc)')"
+  if [[ -z "$APP_SERVER_SOCKET_PATH" ]]; then
+    echo "CODEX_APP_SERVER_URL uses unix:// but does not include a socket path." >&2
+    exit 1
+  fi
+else
+  APP_SERVER_HOST="$(python3 -c 'from urllib.parse import urlparse; import os; print(urlparse(os.environ["CODEX_APP_SERVER_URL"]).hostname or "127.0.0.1")')"
+  APP_SERVER_PORT="$(python3 -c 'from urllib.parse import urlparse; import os; parsed=urlparse(os.environ["CODEX_APP_SERVER_URL"]); print(parsed.port or 80)')"
+fi
 
 port_open() {
   local host="$1"
@@ -88,6 +108,28 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(0.5)
 try:
     sock.connect((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+}
+
+unix_socket_open() {
+  local socket_path="$1"
+  if [[ ! -S "$socket_path" ]]; then
+    return 1
+  fi
+
+  python3 - "$socket_path" <<'PY'
+import socket
+import sys
+
+socket_path = sys.argv[1]
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(0.5)
+try:
+    sock.connect(socket_path)
 except OSError:
     sys.exit(1)
 finally:
@@ -236,9 +278,23 @@ stop_pid_file() {
 }
 
 start_app_server() {
-  if port_open "$APP_SERVER_HOST" "$APP_SERVER_PORT"; then
-    echo "[prototype] Codex app-server already listening at $CODEX_APP_SERVER_URL"
-    return
+  if [[ "$APP_SERVER_SCHEME" == "unix" ]]; then
+    if unix_socket_open "$APP_SERVER_SOCKET_PATH"; then
+      echo "[prototype] Codex app-server already listening at $CODEX_APP_SERVER_URL"
+      return
+    fi
+
+    if [[ -e "$APP_SERVER_SOCKET_PATH" ]]; then
+      echo "[prototype] Removing stale Codex app-server socket at $APP_SERVER_SOCKET_PATH"
+      rm -f "$APP_SERVER_SOCKET_PATH"
+    fi
+
+    mkdir -p "$(dirname "$APP_SERVER_SOCKET_PATH")"
+  else
+    if port_open "$APP_SERVER_HOST" "$APP_SERVER_PORT"; then
+      echo "[prototype] Codex app-server already listening at $CODEX_APP_SERVER_URL"
+      return
+    fi
   fi
 
   echo "[prototype] Starting codex app-server at $CODEX_APP_SERVER_URL"
@@ -249,32 +305,92 @@ start_app_server() {
     "$CODEX_BINARY" app-server --listen "$CODEX_APP_SERVER_URL"
 }
 
+current_bridge_codex_endpoint() {
+  curl -sf "$LOCAL_BRIDGE_URL/health" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("codexEndpoint", ""))' \
+    2>/dev/null || true
+}
+
+wait_for_bridge_to_stop() {
+  for _ in $(seq 1 10); do
+    if ! curl -sf "$LOCAL_BRIDGE_URL/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  return 1
+}
+
+stop_repo_bridge_process_on_port() {
+  local pids
+  pids="$(lsof -nP -tiTCP:"${BRIDGE_PORT}" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -z "$pids" ]]; then
+    return 1
+  fi
+
+  local stopped=1
+  local pid
+  for pid in $pids; do
+    local command
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    local cwd
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
+    if [[ "$command" == *"$BRIDGE_DIR/dist/index.js"* ]] \
+      || [[ "$command" == *"dist/index.js"* && "$cwd" == "$BRIDGE_DIR" ]]; then
+      echo "[prototype] Stopping helm bridge process on port ${BRIDGE_PORT} ($pid)"
+      kill "$pid" >/dev/null 2>&1 || true
+      stopped=0
+    fi
+  done
+
+  return "$stopped"
+}
+
+restart_managed_bridge_or_exit() {
+  local reason="$1"
+  local stopped=1
+
+  if stop_pid_file "helm bridge" "$RUNTIME_DIR/helm-bridge.pid"; then
+    stopped=0
+  fi
+
+  if wait_for_bridge_to_stop; then
+    return
+  fi
+
+  if stop_repo_bridge_process_on_port; then
+    stopped=0
+    if wait_for_bridge_to_stop; then
+      return
+    fi
+  fi
+
+  if [[ "$stopped" -eq 0 ]]; then
+    echo "[prototype] Existing bridge on port ${BRIDGE_PORT} did not stop; cannot restart for ${reason}." >&2
+    exit 1
+  fi
+
+  echo "[prototype] helm bridge is already reachable at $LOCAL_BRIDGE_URL but was not started by this prototype launcher." >&2
+  echo "[prototype] Stop the existing bridge on port ${BRIDGE_PORT}, then rerun scripts/prototype-up.sh so helm can use ${reason}." >&2
+  exit 1
+}
+
 start_bridge() {
   if curl -sf "$LOCAL_BRIDGE_URL/health" >/dev/null 2>&1; then
-    if [[ "$TAILSCALE_ACTIVE" -eq 1 ]] && [[ "$BRIDGE_HOST" == "0.0.0.0" ]]; then
+    local running_codex_endpoint
+    running_codex_endpoint="$(current_bridge_codex_endpoint)"
+    if [[ -n "$running_codex_endpoint" && "$running_codex_endpoint" != "$CODEX_APP_SERVER_URL" ]]; then
+      echo "[prototype] Restarting helm bridge to use Codex app-server $CODEX_APP_SERVER_URL"
+      restart_managed_bridge_or_exit "Codex app-server endpoint $CODEX_APP_SERVER_URL"
+    elif [[ "$TAILSCALE_ACTIVE" -eq 1 ]] && [[ "$BRIDGE_HOST" == "0.0.0.0" ]]; then
       local tailscale_bridge_url="http://${TAILSCALE_IP}:${BRIDGE_PORT}"
       if curl -sf --connect-timeout 2 "$tailscale_bridge_url/health" >/dev/null 2>&1; then
         echo "[prototype] helm bridge already available at $LOCAL_BRIDGE_URL and $tailscale_bridge_url"
         return
       fi
 
-      if stop_pid_file "helm bridge" "$RUNTIME_DIR/helm-bridge.pid"; then
-        for _ in $(seq 1 10); do
-          if ! curl -sf "$LOCAL_BRIDGE_URL/health" >/dev/null 2>&1; then
-            break
-          fi
-          sleep 0.2
-        done
-
-        if curl -sf "$LOCAL_BRIDGE_URL/health" >/dev/null 2>&1; then
-          echo "[prototype] Existing bridge on port ${BRIDGE_PORT} did not stop; cannot restart for Tailscale binding." >&2
-          exit 1
-        fi
-      else
-        echo "[prototype] helm bridge is only reachable locally at $LOCAL_BRIDGE_URL." >&2
-        echo "[prototype] Stop the existing bridge on port ${BRIDGE_PORT}, then rerun scripts/prototype-up.sh so helm can bind for Tailscale." >&2
-        exit 1
-      fi
+      restart_managed_bridge_or_exit "Tailscale binding"
     else
       echo "[prototype] helm bridge already available at $LOCAL_BRIDGE_URL"
       return
@@ -282,8 +398,15 @@ start_bridge() {
   fi
 
   if curl -sf "$LOCAL_BRIDGE_URL/health" >/dev/null 2>&1; then
-    echo "[prototype] helm bridge already available at $LOCAL_BRIDGE_URL"
-    return
+    local running_codex_endpoint
+    running_codex_endpoint="$(current_bridge_codex_endpoint)"
+    if [[ -z "$running_codex_endpoint" || "$running_codex_endpoint" == "$CODEX_APP_SERVER_URL" ]]; then
+      echo "[prototype] helm bridge already available at $LOCAL_BRIDGE_URL"
+      return
+    fi
+
+    echo "[prototype] Restarting helm bridge to use Codex app-server $CODEX_APP_SERVER_URL"
+    restart_managed_bridge_or_exit "Codex app-server endpoint $CODEX_APP_SERVER_URL"
   fi
 
   echo "[prototype] Starting helm bridge at http://${BRIDGE_HOST}:${BRIDGE_PORT}"
@@ -292,6 +415,19 @@ start_bridge() {
     npm install >/dev/null
     npm run build >/dev/null
   )
+
+  if curl -sf "$LOCAL_BRIDGE_URL/health" >/dev/null 2>&1; then
+    local running_codex_endpoint
+    running_codex_endpoint="$(current_bridge_codex_endpoint)"
+    if [[ -z "$running_codex_endpoint" || "$running_codex_endpoint" == "$CODEX_APP_SERVER_URL" ]]; then
+      echo "[prototype] helm bridge became available at $LOCAL_BRIDGE_URL"
+      return
+    fi
+
+    echo "[prototype] Restarting helm bridge to use Codex app-server $CODEX_APP_SERVER_URL"
+    restart_managed_bridge_or_exit "Codex app-server endpoint $CODEX_APP_SERVER_URL"
+  fi
+
   launch_detached \
     "$RUNTIME_DIR/helm-bridge.pid" \
     "$LOG_DIR/helm-bridge.log" \

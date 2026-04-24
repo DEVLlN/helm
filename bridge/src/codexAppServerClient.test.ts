@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { CodexAppServerClient, currentPromptDraftFromTerminalTail } from "./codexAppServerClient.js";
+import { codexProjectNameForPath } from "./codexProjectNames.js";
 import type { JSONValue } from "./types.js";
 
 type CodexClientPrivateHooks = {
@@ -35,6 +40,7 @@ type CodexClientPrivateHooks = {
     id?: string;
     cwd?: string;
     sourceKind?: string | null;
+    projectName?: string | null;
     updatedAt?: number;
     name: string | null;
     preview: string;
@@ -72,6 +78,124 @@ type CodexClientPrivateHooks = {
   shouldPreferCLIResumeFallback(threadId: string): Promise<boolean>;
   shouldPreferShellRelayFirst(threadId: string): Promise<boolean>;
 };
+
+function encodeRawServerTextFrame(text: string): Buffer {
+  const payload = Buffer.from(text, "utf8");
+  if (payload.length < 126) {
+    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  }
+
+  if (payload.length < 65_536) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([header, payload]);
+  }
+
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(payload.length), 2);
+  return Buffer.concat([header, payload]);
+}
+
+function decodeRawClientTextFrame(buffer: Buffer): { text: string; consumed: number } | null {
+  if (buffer.length < 2) {
+    return null;
+  }
+
+  const firstByte = buffer[0]!;
+  const secondByte = buffer[1]!;
+  const opcode = firstByte & 0x0f;
+  let length = secondByte & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < offset + 2) {
+      return null;
+    }
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (length === 127) {
+    if (buffer.length < offset + 8) {
+      return null;
+    }
+    length = Number(buffer.readBigUInt64BE(offset));
+    offset += 8;
+  }
+
+  const masked = (secondByte & 0x80) !== 0;
+  if (!masked || opcode !== 1) {
+    throw new Error("expected masked text frame");
+  }
+
+  if (buffer.length < offset + 4 + length) {
+    return null;
+  }
+
+  const mask = buffer.subarray(offset, offset + 4);
+  offset += 4;
+  const payload = Buffer.from(buffer.subarray(offset, offset + length));
+  for (let index = 0; index < payload.length; index += 1) {
+    payload[index] = payload[index]! ^ mask[index % 4]!;
+  }
+
+  return { text: payload.toString("utf8"), consumed: offset + length };
+}
+
+test("Codex app-server client initializes over raw unix socket transport", async (t) => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const directory = mkdtempSync(path.join(tmpdir(), "codex-app-server-unix-"));
+  const socketPath = path.join(directory, "app.sock");
+  const server = net.createServer((socket) => {
+    let buffer = Buffer.alloc(0);
+
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const frame = decodeRawClientTextFrame(buffer);
+      if (!frame) {
+        return;
+      }
+
+      buffer = buffer.subarray(frame.consumed);
+      const request = JSON.parse(frame.text) as {
+        id: string | number;
+        method?: string;
+      };
+      assert.equal(request.method, "initialize");
+      socket.write(encodeRawServerTextFrame(JSON.stringify({
+        id: request.id,
+        result: {
+          userAgent: "fake-codex",
+          codexHome: directory,
+          platformFamily: "unix",
+          platformOs: "macos",
+        },
+      })), () => {
+        socket.destroy();
+      });
+    });
+  });
+
+  t.after(() => {
+    server.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  const client = new CodexAppServerClient(`unix://${socketPath}`);
+  await client.connect();
+});
 
 test("Codex CLI thread reads use local rollout before app-server", async () => {
   const client = new CodexAppServerClient("ws://127.0.0.1:0");
@@ -350,6 +474,7 @@ test("Codex app-server list rewrites running title-only previews to waiting plac
           name: "Test app and fix bugs",
           preview: "Test app and fix bugs",
           cwd: "/tmp/project",
+          projectName: "Codex Project",
           status: { type: "running" },
           updatedAt: 456_000,
           source: "vscode",
@@ -370,8 +495,35 @@ test("Codex app-server list rewrites running title-only previews to waiting plac
   const threads = await hooks.listThreadsFromAppServer();
 
   assert.equal(threads[0]?.preview, "Waiting for output...");
+  assert.equal(threads[0]?.projectName, "Codex Project");
   assert.equal(threads[1]?.preview, "No activity yet.");
   assert.equal(threads[0]?.sourceKind, "vscode");
+});
+
+test("Codex project names resolve from desktop workspace-root labels", () => {
+  const previousPath = process.env.CODEX_GLOBAL_STATE_PATH;
+  const folder = mkdtempSync(path.join(tmpdir(), "helm-codex-project-"));
+  const statePath = path.join(folder, ".codex-global-state.json");
+  process.env.CODEX_GLOBAL_STATE_PATH = statePath;
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      "electron-workspace-root-labels": {
+        "/Users/devlin/Documents/New project": "Wedding",
+      },
+    }),
+    "utf8"
+  );
+
+  try {
+    assert.equal(codexProjectNameForPath("/Users/devlin/Documents/New project"), "Wedding");
+  } finally {
+    if (previousPath === undefined) {
+      delete process.env.CODEX_GLOBAL_STATE_PATH;
+    } else {
+      process.env.CODEX_GLOBAL_STATE_PATH = previousPath;
+    }
+  }
 });
 
 test("recent title-only unknown app-server sessions stay idle", async () => {

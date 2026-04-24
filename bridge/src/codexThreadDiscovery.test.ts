@@ -83,11 +83,54 @@ test("local rollout fallback emits viewed image tool calls", () => {
     "thread-1"
   );
 
-  const turn = turns[0] as { items?: Array<{ type?: string; tool?: string; contentItems?: string }> } | undefined;
+  const turn = turns[0] as {
+    items?: Array<{
+      type?: string;
+      tool?: string;
+      contentItems?: string;
+      imageAttachments?: Array<{ path?: string; mimeType?: string; filename?: string }>;
+    }>;
+  } | undefined;
   const item = turn?.items?.[0];
   assert.equal(item?.type, "dynamicToolCall");
   assert.equal(item?.tool, "Viewed Image");
   assert.equal(item?.contentItems, imagePath);
+  assert.equal(item?.imageAttachments?.[0]?.path, imagePath);
+  assert.equal(item?.imageAttachments?.[0]?.mimeType, "image/jpeg");
+  assert.equal(item?.imageAttachments?.[0]?.filename, "dropped-image-1.jpg");
+});
+
+test("local rollout fallback emits generated image attachments", () => {
+  const imagePath = "/Users/devlin/.codex/generated_images/thread-1/ig_result.png";
+  const turns = parseCodexRolloutTurns(
+    [
+      rolloutLine({ type: "task_started", turn_id: "turn-1" }),
+      rolloutLine({
+        type: "image_generation_end",
+        turn_id: "turn-1",
+        saved_path: imagePath,
+        revised_prompt: "A Helm app icon.",
+      }),
+    ].join("\n"),
+    "thread-1"
+  );
+
+  const turn = turns[0] as {
+    items?: Array<{
+      type?: string;
+      tool?: string;
+      contentItems?: string;
+      imageAttachments?: Array<{ path?: string; mimeType?: string; filename?: string; source?: string }>;
+    }>;
+  } | undefined;
+  const item = turn?.items?.[0];
+  assert.equal(item?.type, "dynamicToolCall");
+  assert.equal(item?.tool, "Generated Image");
+  assert.equal(item?.contentItems, imagePath);
+  assert.equal(item?.imageAttachments?.[0]?.path, imagePath);
+  assert.equal(item?.imageAttachments?.[0]?.mimeType, "image/png");
+  assert.equal(item?.imageAttachments?.[0]?.filename, "ig_result.png");
+  assert.equal(item?.imageAttachments?.[0]?.source, "image_generation");
 });
 
 test("local rollout fallback emits called MCP tool calls", () => {

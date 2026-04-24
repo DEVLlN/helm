@@ -21,7 +21,10 @@ export const config = {
   bridgeHost: optionalEnv("BRIDGE_HOST", "0.0.0.0"),
   bridgePort: Number.parseInt(optionalEnv("BRIDGE_PORT", "8787"), 10),
   bridgePreferredURL: process.env.BRIDGE_PREFERRED_URL?.trim() || null,
-  codexAppServerUrl: optionalEnv("CODEX_APP_SERVER_URL", "ws://127.0.0.1:6060"),
+  codexAppServerUrl: optionalEnv(
+    "CODEX_APP_SERVER_URL",
+    `unix://${join(homedir(), ".local", "share", "helm", "codex-app-server.sock")}`
+  ),
   bridgePairingFile: optionalEnv(
     "BRIDGE_PAIRING_FILE",
     join(homedir(), "Library", "Application Support", "Helm", "bridge-pairing.json")

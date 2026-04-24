@@ -15,13 +15,15 @@ import { promisify } from "node:util";
 import { HELM_RUNTIME_LAUNCH_SOURCE } from "./helmManagedLaunch.js";
 import { listCodexThreadReplacements } from "./codexThreadReplacementRegistry.js";
 import { findMatchingLaunchByCWD, findMatchingLaunchByThreadID } from "./runtimeLaunchRegistry.js";
-import type { JSONValue, ThreadSummary } from "./types.js";
+import type { JSONValue, ThreadImageAttachment, ThreadSummary } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_LIMIT = 50;
 const MAX_LOCAL_ROLLOUT_TEXT_LENGTH = 20_000;
 const MAX_LOCAL_ROLLOUT_STREAM_TEXT_LENGTH = 64_000;
 const LOCAL_ROLLOUT_TAIL_READ_BYTES = 12 * 1024 * 1024;
+const LOCAL_IMAGE_PATH_RE =
+  /(?:^|[\s("'`])((?:\/Users\/|\/private\/var\/|\/var\/folders\/|\/tmp\/)[^\s"'`)<]+?\.(?:png|jpe?g|webp|gif|heic|heif))(?:$|[\s"')>`])/giu;
 
 type CodexThreadRow = {
   id?: string;
@@ -621,12 +623,37 @@ function localRolloutItem(
     }
     case "view_image_tool_call": {
       const imagePath = boundedHeadText(stringValue(payload.path));
+      const imageAttachments = imagePath
+        ? imageAttachmentsFromPaths([imagePath], `local-view-image-${index}`, "view_image")
+        : [];
       return {
         id: `local-view-image-${index}`,
         type: "dynamicToolCall",
         tool: "Viewed Image",
         contentItems: imagePath,
         status: "completed",
+        ...(imageAttachments.length > 0 ? { imageAttachments } : {}),
+      };
+    }
+    case "image_generation_end": {
+      const imagePath = boundedHeadText(
+        stringValue(payload.saved_path) ??
+        stringValue(payload.path) ??
+        stringValue(payload.output_path)
+      );
+      if (!imagePath) {
+        return null;
+      }
+
+      const imageAttachments = imageAttachmentsFromPaths([imagePath], `local-generated-image-${index}`, "image_generation");
+      return {
+        id: `local-generated-image-${index}`,
+        type: "dynamicToolCall",
+        tool: "Generated Image",
+        contentItems: imagePath,
+        status: "completed",
+        metadataSummary: boundedHeadText(stringValue(payload.revised_prompt), 280),
+        ...(imageAttachments.length > 0 ? { imageAttachments } : {}),
       };
     }
     case "mcp_tool_call_end": {
@@ -671,6 +698,19 @@ function localRolloutItemIdentity(item: JSONValue): string | null {
     case "agentMessage": {
       const text = comparableRolloutText(stringValue(itemObject.text));
       return text ? `agent:${text}` : null;
+    }
+    case "dynamicToolCall": {
+      const tool = comparableRolloutText(stringValue(itemObject.tool));
+      const contentItems = comparableRolloutText(stringValue(itemObject.contentItems));
+      const imageAttachmentText = Array.isArray(itemObject.imageAttachments)
+        ? itemObject.imageAttachments
+            .map((entry) => stringValue(objectValue(entry)?.path))
+            .filter((entry): entry is string => Boolean(entry))
+            .join(",")
+        : "";
+      return tool || contentItems || imageAttachmentText
+        ? `tool:${tool ?? ""}:${contentItems ?? ""}:${imageAttachmentText}`
+        : null;
     }
     case "plan": {
       const text = comparableRolloutText(stringValue(itemObject.text));
@@ -751,15 +791,82 @@ function responseMessageRolloutItem(
 ): JSONValue | null {
   const outputText = responseContentText(payload.content, "output_text");
   if (outputText) {
+    const imageAttachments = imageAttachmentsFromText(outputText, `local-agent-response-${index}`, "message");
     return {
       id: `local-agent-response-${index}`,
       type: "agentMessage",
       text: boundedTailText(outputText),
       phase: "response_item",
+      ...(imageAttachments.length > 0 ? { imageAttachments } : {}),
     };
   }
 
   return null;
+}
+
+function imageAttachmentsFromText(
+  text: string,
+  idPrefix: string,
+  source: string
+): ThreadImageAttachment[] {
+  const paths: string[] = [];
+  LOCAL_IMAGE_PATH_RE.lastIndex = 0;
+  for (const match of text.matchAll(LOCAL_IMAGE_PATH_RE)) {
+    if (match[1]) {
+      paths.push(match[1]);
+    }
+  }
+  return imageAttachmentsFromPaths(paths, idPrefix, source);
+}
+
+function imageAttachmentsFromPaths(
+  imagePaths: string[],
+  idPrefix: string,
+  source: string
+): ThreadImageAttachment[] {
+  const seen = new Set<string>();
+  const attachments: ThreadImageAttachment[] = [];
+  for (const rawPath of imagePaths) {
+    const imagePath = rawPath.trim();
+    if (!imagePath || seen.has(imagePath)) {
+      continue;
+    }
+
+    const mimeType = imageMimeTypeForPath(imagePath);
+    if (!mimeType) {
+      continue;
+    }
+
+    seen.add(imagePath);
+    attachments.push({
+      id: `${idPrefix}-image-${attachments.length + 1}`,
+      path: imagePath,
+      mimeType,
+      filename: path.basename(imagePath),
+      source,
+    });
+  }
+  return attachments;
+}
+
+function imageMimeTypeForPath(imagePath: string): string | null {
+  switch (path.extname(imagePath).toLowerCase()) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".heic":
+      return "image/heic";
+    case ".heif":
+      return "image/heif";
+    default:
+      return null;
+  }
 }
 
 function responseContentText(

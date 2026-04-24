@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import express from "express";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { IncomingMessage } from "node:http";
 import { homedir, networkInterfaces } from "node:os";
@@ -14,6 +14,7 @@ import { CommandModeDriver } from "./commandModeDriver.js";
 import { config } from "./config.js";
 import { ClaudeCodeBackend } from "./claudeCodeBackend.js";
 import { CodexBackend } from "./codexBackend.js";
+import { listCodexAutomations } from "./codexAutomations.js";
 import {
   canonicalCodexThreadId,
   deleteCodexThreadReplacement,
@@ -35,6 +36,7 @@ import {
   resolveCodexThreadRolloutPath,
   resolveCodexThreadByName,
 } from "./codexThreadDiscovery.js";
+import { codexProjectNameForPath } from "./codexProjectNames.js";
 import { HELM_RUNTIME_LAUNCH_SOURCE, isHelmManagedLaunchSource } from "./helmManagedLaunch.js";
 import { ManagedTerminalBackend } from "./managedTerminalBackend.js";
 import { NvidiaAIVoiceProvider } from "./nvidiaAIVoiceProvider.js";
@@ -73,6 +75,7 @@ import type {
   ServerRequestEvent,
   StartTurnFileAttachment,
   StartTurnImageAttachment,
+  ThreadImageAttachment,
   TurnDeliveryMode,
   ThreadDetail,
   ThreadDetailItem,
@@ -154,6 +157,7 @@ export class BridgeServer {
   private static readonly TURN_IMAGE_MAX_ATTACHMENTS = 4;
   private static readonly TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
   private static readonly TURN_IMAGE_TOTAL_MAX_BYTES = 16 * 1024 * 1024;
+  private static readonly MEDIA_IMAGE_MAX_BYTES = 32 * 1024 * 1024;
   private static readonly TURN_FILE_MAX_ATTACHMENTS = 4;
   private static readonly TURN_FILE_MAX_BYTES = 4 * 1024 * 1024;
   private static readonly TURN_FILE_TOTAL_MAX_BYTES = 12 * 1024 * 1024;
@@ -346,6 +350,18 @@ export class BridgeServer {
       }
     });
 
+    this.app.get("/api/media/image", async (req, res) => {
+      try {
+        const image = await this.readLocalImageMedia(req.query.path);
+        res.setHeader("Cache-Control", "private, max-age=300");
+        res.setHeader("Content-Type", image.mimeType);
+        res.setHeader("Content-Length", String(image.data.byteLength));
+        res.send(image.data);
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
     this.app.get("/simulator", (req, res) => {
       const token = this.requestToken(req);
       if (!token) {
@@ -483,6 +499,16 @@ export class BridgeServer {
         const provider = this.voiceProviders.get(this.defaultVoiceProviderId);
         const summary = provider ? await provider.getSummary() : null;
         res.json(this.commandModeDriver.buildSummary(summary));
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
+    this.app.get("/api/automations", async (_req, res) => {
+      try {
+        res.json({
+          automations: await listCodexAutomations(),
+        });
       } catch (error) {
         this.handleError(res, error);
       }
@@ -1852,6 +1878,9 @@ export class BridgeServer {
       ),
       cwd: detail.cwd,
       workspacePath: detail.workspacePath ?? null,
+      projectName: detail.projectName
+        ?? fallbackThread?.projectName
+        ?? codexProjectNameForPath(detail.workspacePath ?? detail.cwd),
       status,
       updatedAt: detail.updatedAt,
       sourceKind: detail.sourceKind,
@@ -2173,6 +2202,9 @@ export class BridgeServer {
       ),
       cwd,
       workspacePath: workspacePath || null,
+      projectName: detail.projectName
+        ?? thread.projectName
+        ?? codexProjectNameForPath(workspacePath || cwd),
       status: this.preferredThreadStatus(detail.status, thread.status, detail.updatedAt || thread.updatedAt),
       updatedAt: this.normalizeThreadUpdatedAt(detail.updatedAt || thread.updatedAt),
       sourceKind: detail.sourceKind ?? thread.sourceKind,
@@ -2316,11 +2348,13 @@ export class BridgeServer {
 
   private static materialItemIdentity(item: ThreadDetailItem): string {
     const text = item.rawText ?? item.detail ?? "";
+    const imagePaths = item.imageAttachments?.map((attachment) => attachment.path).join(",") ?? "";
     return [
       item.id,
       item.type,
       item.title ?? "",
       text,
+      imagePaths,
     ].join("\u{1f}");
   }
 
@@ -2427,6 +2461,7 @@ export class BridgeServer {
       name: summary.name,
       cwd: summary.cwd,
       workspacePath: summary.workspacePath ?? null,
+      projectName: summary.projectName ?? codexProjectNameForPath(summary.workspacePath ?? summary.cwd),
       status: summary.status,
       updatedAt: this.normalizeThreadUpdatedAt(summary.updatedAt),
       sourceKind: summary.sourceKind,
@@ -2493,6 +2528,9 @@ export class BridgeServer {
     const detailWithWorkspace = {
       ...detail,
       workspacePath: workspacePath || null,
+      projectName: detail.projectName
+        ?? summary.projectName
+        ?? codexProjectNameForPath(workspacePath || detail.cwd),
     };
 
     return options.includeLiveRuntimeTail
@@ -2550,6 +2588,9 @@ export class BridgeServer {
     const detailWithWorkspace = {
       ...detail,
       workspacePath: workspacePath || null,
+      projectName: detail.projectName
+        ?? threadSummary?.projectName
+        ?? codexProjectNameForPath(workspacePath || detail.cwd),
     };
 
     if (!options.includeLiveRuntimeTail) {
@@ -3094,6 +3135,8 @@ export class BridgeServer {
       name: typeof thread.name === "string" ? thread.name : null,
       cwd: typeof thread.cwd === "string" ? thread.cwd : "",
       workspacePath: summary?.workspacePath ?? null,
+      projectName: this.projectNameText(thread, summary?.projectName ?? null)
+        ?? codexProjectNameForPath(summary?.workspacePath ?? (typeof thread.cwd === "string" ? thread.cwd : "")),
       status,
       updatedAt,
       sourceKind: summary?.sourceKind ?? null,
@@ -3454,8 +3497,10 @@ export class BridgeServer {
 
     const type = typeof value.type === "string" ? value.type : "unknown";
     const id = typeof value.id === "string" ? value.id : `${type}-${Math.random().toString(36).slice(2, 8)}`;
+    const imageAttachments = this.normalizeThreadImageAttachments(value.imageAttachments);
 
-    switch (type) {
+    const normalized = (() : ThreadDetailItem => {
+      switch (type) {
       case "userMessage":
         return {
           id,
@@ -3564,7 +3609,9 @@ export class BridgeServer {
           detail: this.bestDetail(value.result) ?? this.bestDetail(value.error),
           status: typeof value.status === "string" ? value.status : null,
           rawText: this.bestDetail(value.result) ?? this.bestDetail(value.error),
-          metadataSummary: this.toolMetadataSummary(value),
+          metadataSummary: typeof value.metadataSummary === "string"
+            ? value.metadataSummary
+            : this.toolMetadataSummary(value),
           command: null,
           cwd: null,
           exitCode: null,
@@ -3578,7 +3625,9 @@ export class BridgeServer {
           detail: this.bestDetail(value.contentItems),
           status: typeof value.status === "string" ? value.status : null,
           rawText: this.bestDetail(value.contentItems),
-          metadataSummary: this.toolMetadataSummary(value),
+          metadataSummary: typeof value.metadataSummary === "string"
+            ? value.metadataSummary
+            : this.toolMetadataSummary(value),
           command: null,
           cwd: null,
           exitCode: null,
@@ -3611,7 +3660,58 @@ export class BridgeServer {
           cwd: null,
           exitCode: null,
         };
+      }
+    })();
+
+    return imageAttachments.length > 0
+      ? {
+          ...normalized,
+          imageAttachments,
+        }
+      : normalized;
+  }
+
+  private normalizeThreadImageAttachments(value: JSONValue | undefined): ThreadImageAttachment[] {
+    if (!Array.isArray(value)) {
+      return [];
     }
+
+    const seenPaths = new Set<string>();
+    const attachments: ThreadImageAttachment[] = [];
+    for (const entry of value) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+
+      const imagePath = typeof entry.path === "string" ? entry.path.trim() : "";
+      if (!imagePath || seenPaths.has(imagePath)) {
+        continue;
+      }
+
+      const mimeType = typeof entry.mimeType === "string" && entry.mimeType.trim().length > 0
+        ? entry.mimeType.trim()
+        : this.imageMimeTypeForPath(imagePath);
+      if (!mimeType?.startsWith("image/")) {
+        continue;
+      }
+
+      seenPaths.add(imagePath);
+      attachments.push({
+        id: typeof entry.id === "string" && entry.id.trim().length > 0
+          ? entry.id.trim()
+          : `image-${attachments.length + 1}`,
+        path: imagePath,
+        mimeType,
+        filename: typeof entry.filename === "string" && entry.filename.trim().length > 0
+          ? entry.filename.trim()
+          : path.basename(imagePath),
+        source: typeof entry.source === "string" && entry.source.trim().length > 0
+          ? entry.source.trim()
+          : null,
+      });
+    }
+
+    return attachments;
   }
 
   private trimThreadTurns(turns: ThreadDetailTurn[]): ThreadDetailTurn[] {
@@ -3927,6 +4027,36 @@ export class BridgeServer {
       : `${normalized.slice(0, 279).trimEnd()}…`;
   }
 
+  private projectNameText(thread: Record<string, unknown>, fallback: string | null = null): string | null {
+    const project = thread.project && typeof thread.project === "object" && !Array.isArray(thread.project)
+      ? thread.project as Record<string, unknown>
+      : null;
+    const candidates = [
+      thread.projectName,
+      thread.project_name,
+      thread.projectTitle,
+      thread.projectDisplayName,
+      thread.workspaceName,
+      thread.workspaceDisplayName,
+      project?.name,
+      project?.title,
+      project?.displayName,
+      fallback,
+    ];
+
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") {
+        continue;
+      }
+      const trimmed = candidate.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
+
+    return null;
+  }
+
   private withControllerMetadata(threads: ThreadSummary[]): ThreadSummary[] {
     return threads.map((thread) => {
       this.threadBackendIds.set(thread.id, thread.backendId);
@@ -4099,6 +4229,7 @@ export class BridgeServer {
         return {
           ...thread,
           workspacePath: workspacePath || null,
+          projectName: thread.projectName ?? codexProjectNameForPath(workspacePath || thread.cwd),
         };
       })
     );
@@ -4712,6 +4843,61 @@ export class BridgeServer {
     }
 
     throw new HttpError(501, `${backend.summary.label} does not currently support Realtime Command voice`);
+  }
+
+  private async readLocalImageMedia(value: unknown): Promise<{ data: Buffer; mimeType: string }> {
+    const rawPath = Array.isArray(value) ? value[0] : value;
+    const requestedPath = typeof rawPath === "string" ? rawPath.trim() : "";
+    if (!requestedPath) {
+      throw new HttpError(400, "Missing image path.");
+    }
+    if (!path.isAbsolute(requestedPath)) {
+      throw new HttpError(400, "Image path must be absolute.");
+    }
+
+    const resolvedPath = path.resolve(requestedPath);
+    const mimeType = this.imageMimeTypeForPath(resolvedPath);
+    if (!mimeType) {
+      throw new HttpError(415, "Unsupported image type.");
+    }
+
+    let fileStats;
+    try {
+      fileStats = await stat(resolvedPath);
+    } catch {
+      throw new HttpError(404, "Image file not found.");
+    }
+    if (!fileStats.isFile()) {
+      throw new HttpError(404, "Image file not found.");
+    }
+    if (fileStats.size > BridgeServer.MEDIA_IMAGE_MAX_BYTES) {
+      throw new HttpError(413, "Image file is too large for mobile preview.");
+    }
+
+    return {
+      data: await readFile(resolvedPath),
+      mimeType,
+    };
+  }
+
+  private imageMimeTypeForPath(imagePath: string): string | null {
+    switch (path.extname(imagePath).toLowerCase()) {
+      case ".png":
+        return "image/png";
+      case ".jpg":
+      case ".jpeg":
+        return "image/jpeg";
+      case ".webp":
+        return "image/webp";
+      case ".gif":
+        return "image/gif";
+      case ".heic":
+        return "image/heic";
+      case ".heif":
+        return "image/heif";
+      default:
+        return null;
+    }
   }
 
   private isPublicRoute(path: string): boolean {

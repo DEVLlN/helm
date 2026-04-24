@@ -46,6 +46,7 @@ local_bridge_url = sys.argv[5]
 log_dir = sys.argv[6]
 
 print(f"Local bridge: {local_bridge_url}")
+print(f"Codex app-server: {health.get('codexEndpoint', 'unknown')}")
 print(f"Default backend: {health.get('defaultBackendId', 'unknown')}")
 print(f"Pairing token hint: {pairing.get('tokenHint', 'unknown')}")
 

@@ -63,6 +63,7 @@ export type ThreadSummary = {
   preview: string;
   cwd: string;
   workspacePath?: string | null;
+  projectName?: string | null;
   status: string;
   updatedAt: number;
   sourceKind: string | null;
@@ -131,6 +132,25 @@ export type CommandModeSummary = {
   notes: string;
 };
 
+export type CodexAutomationSummary = {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  schedule: string | null;
+  scheduleSummary: string;
+  model: string | null;
+  reasoningEffort: string | null;
+  executionEnvironment: string | null;
+  cwd: string | null;
+  cwds: string[];
+  prompt: string;
+  promptPreview: string;
+  createdAt: number | null;
+  updatedAt: number | null;
+  sourcePath: string;
+};
+
 export type ConversationEvent = {
   method: string;
   params?: JSONValue;
@@ -147,6 +167,14 @@ export type ThreadController = {
   clientName: string;
   claimedAt: number;
   lastSeenAt: number;
+};
+
+export type ThreadImageAttachment = {
+  id: string;
+  path: string;
+  mimeType: string | null;
+  filename: string | null;
+  source: string | null;
 };
 
 export type RuntimePhase = "idle" | "running" | "waitingApproval" | "blocked" | "completed" | "unknown";
@@ -201,6 +229,7 @@ export type ThreadDetailItem = {
   command: string | null;
   cwd: string | null;
   exitCode: number | null;
+  imageAttachments?: ThreadImageAttachment[];
 };
 
 export type ThreadDetailTurn = {
@@ -215,6 +244,7 @@ export type ThreadDetail = {
   name: string | null;
   cwd: string;
   workspacePath?: string | null;
+  projectName?: string | null;
   status: string;
   updatedAt: number;
   sourceKind: string | null;

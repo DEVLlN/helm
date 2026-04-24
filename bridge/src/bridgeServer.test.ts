@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { BridgeServer } from "./bridgeServer.js";
+import { listCodexAutomations, parseCodexAutomationToml } from "./codexAutomations.js";
 import type {
   BackendSummary,
   JSONValue,
@@ -252,6 +256,68 @@ test("thread previews prefer the newest turn text in newest-first thread order",
   });
 
   assert.equal(preview, "Newest prompt\nNewest reply");
+});
+
+test("Codex automation parser extracts schedule and execution metadata", () => {
+  const automation = parseCodexAutomationToml(`
+version = 1
+id = "performance-audit"
+kind = "cron"
+name = "Performance audit"
+prompt = "Audit performance regressions.\\nReport measurements."
+status = "ACTIVE"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=8;BYMINUTE=0;BYDAY=MO"
+model = "gpt-5.4"
+reasoning_effort = "medium"
+execution_environment = "worktree"
+cwds = ["/Users/devlin/GitHub/prediction-markets-bot"]
+created_at = 1776825539662
+updated_at = 1776825539662
+`, "/tmp/automation.toml");
+
+  assert.equal(automation?.id, "performance-audit");
+  assert.equal(automation?.name, "Performance audit");
+  assert.equal(automation?.status, "ACTIVE");
+  assert.equal(automation?.scheduleSummary, "Weekly Monday at 8:00 AM");
+  assert.equal(automation?.cwd, "/Users/devlin/GitHub/prediction-markets-bot");
+  assert.equal(automation?.prompt, "Audit performance regressions.\nReport measurements.");
+});
+
+test("Codex automation list reads automation directories and sorts active entries first", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "helm-automations-"));
+  mkdirSync(path.join(root, "paused-task"));
+  mkdirSync(path.join(root, "active-task"));
+  writeFileSync(path.join(root, "paused-task", "automation.toml"), `
+id = "paused-task"
+kind = "cron"
+name = "Paused task"
+prompt = "Paused"
+status = "PAUSED"
+updated_at = 200
+`);
+  writeFileSync(path.join(root, "active-task", "automation.toml"), `
+id = "active-task"
+kind = "cron"
+name = "Active task"
+prompt = "Active"
+status = "ACTIVE"
+updated_at = 100
+`);
+
+  const previous = process.env.CODEX_AUTOMATIONS_DIR;
+  process.env.CODEX_AUTOMATIONS_DIR = root;
+  try {
+    assert.deepEqual(
+      (await listCodexAutomations()).map((automation) => automation.id),
+      ["active-task", "paused-task"]
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CODEX_AUTOMATIONS_DIR;
+    } else {
+      process.env.CODEX_AUTOMATIONS_DIR = previous;
+    }
+  }
 });
 
 test("idle thread preview merge prefers fresh detail over stale fallback text", () => {
