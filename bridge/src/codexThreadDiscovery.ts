@@ -449,6 +449,15 @@ export function parseCodexRolloutTurns(content: string, threadId: string): JSONV
 
     const record = parseJSONObject(trimmed);
     const payload = objectValue(record?.payload);
+    if (record?.type === "turn_context") {
+      const contextTurnId = stringValue(payload?.turn_id);
+      if (contextTurnId) {
+        currentTurnId = contextTurnId;
+        getTurn(currentTurnId, index).status = "running";
+      }
+      continue;
+    }
+
     const payloadType = stringValue(payload?.type);
     if (!record || !payload || !payloadType) {
       continue;

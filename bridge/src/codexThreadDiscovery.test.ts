@@ -203,6 +203,43 @@ test("local rollout fallback emits update plan task items", () => {
   assert.equal(item?.metadataSummary, "Working through the visible task list.");
 });
 
+test("local rollout fallback assigns tailed response plans to turn context", () => {
+  const turns = parseCodexRolloutTurns(
+    [
+      JSON.stringify({
+        type: "turn_context",
+        payload: { turn_id: "turn-1" },
+      }),
+      responseLine({
+        type: "function_call",
+        name: "update_plan",
+        arguments: JSON.stringify({
+          plan: [
+            { step: "Rank replay blockers", status: "completed" },
+            { step: "Patch passive completion hold gate", status: "in_progress" },
+            { step: "Verify parity metrics", status: "pending" },
+          ],
+        }),
+      }),
+      rolloutLine({
+        type: "exec_command_end",
+        turn_id: "turn-1",
+        command: "pytest",
+        status: "completed",
+        exit_code: 0,
+      }),
+    ].join("\n"),
+    "thread-1"
+  ) as Array<{ id: string; items: Array<{ type?: string; text?: string; command?: string }> }>;
+
+  assert.equal(turns[0]?.id, "turn-1");
+  assert.deepEqual(
+    turns[0]?.items.map((item) => item.type),
+    ["plan", "commandExecution"]
+  );
+  assert.match(turns[0]?.items[0]?.text ?? "", /Patch passive completion hold gate/);
+});
+
 test("local rollout fallback orders turns by most recent activity", () => {
   const turns = parseCodexRolloutTurns(
     [

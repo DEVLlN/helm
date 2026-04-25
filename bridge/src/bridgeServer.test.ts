@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { BridgeServer } from "./bridgeServer.js";
+import { BridgeServer, readGitBranchStatus } from "./bridgeServer.js";
 import { listCodexAutomations, parseCodexAutomationToml } from "./codexAutomations.js";
 import type {
   BackendSummary,
@@ -178,6 +179,35 @@ test("bridge codex registry naming prefers first user message over degraded Helm
     }),
     "mobile app support for creating a thread in Codex App OR Codex ClI"
   );
+});
+
+test("git branch status reports local branches for toolbar branch switching", () => {
+  const repo = mkdtempSync(path.join(tmpdir(), "helm-git-branches-"));
+  execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "helm@example.com"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Helm Test"], { cwd: repo, stdio: "ignore" });
+  writeFileSync(path.join(repo, "README.md"), "helm\n");
+  execFileSync("git", ["add", "README.md"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: repo, stdio: "ignore" });
+  execFileSync("git", ["branch", "feature/toolbar"], { cwd: repo, stdio: "ignore" });
+
+  assert.deepEqual(readGitBranchStatus(repo), {
+    cwd: repo,
+    isRepository: true,
+    currentBranch: "main",
+    branches: ["feature/toolbar", "main"],
+  });
+});
+
+test("git branch status treats non-repositories as unavailable", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "helm-no-git-"));
+
+  assert.deepEqual(readGitBranchStatus(directory), {
+    cwd: directory,
+    isRepository: false,
+    currentBranch: null,
+    branches: [],
+  });
 });
 
 test("running thread summaries synthesize a waiting preview when detail is blank", () => {
@@ -1861,6 +1891,61 @@ test("oversized turns preserve the newest terminal rows instead of only conversa
   assert.equal(compacted.items[0]?.id, "user-1");
   assert.equal(compacted.items.includes(items.at(-2)!), true);
   assert.equal(compacted.items.at(-1)?.id, "latest-agent");
+  assert.ok(compacted.items.length <= 24);
+});
+
+test("oversized turns preserve the latest plan item for pinned task lists", () => {
+  const items: ThreadDetailItem[] = [
+    threadItem({
+      id: "user-1",
+      type: "userMessage",
+      title: "User message",
+      rawText: "start",
+      detail: "start",
+    }),
+    threadItem({
+      id: "plan-1",
+      type: "plan",
+      title: "2 out of 5 tasks completed",
+      rawText: [
+        "2 out of 5 tasks completed",
+        "✓ Rank replay blockers",
+        "✓ Inspect diagnostics",
+        "◉ Patch passive completion hold gate",
+        "□ Run focused replay/tests",
+        "□ Commit and push",
+      ].join("\n"),
+      detail: [
+        "2 out of 5 tasks completed",
+        "✓ Rank replay blockers",
+        "✓ Inspect diagnostics",
+        "◉ Patch passive completion hold gate",
+        "□ Run focused replay/tests",
+        "□ Commit and push",
+      ].join("\n"),
+    }),
+  ];
+
+  for (let index = 0; index < 30; index += 1) {
+    items.push(threadItem({
+      id: `command-${index}`,
+      type: "commandExecution",
+      title: "Terminal",
+      rawText: `command output ${index}`,
+      detail: `command output ${index}`,
+    }));
+  }
+
+  const compacted = compactTurn({
+    id: "turn-1",
+    status: "running",
+    error: null,
+    items,
+  });
+
+  assert.equal(compacted.items[0]?.id, "user-1");
+  assert.equal(compacted.items.some((item) => item.id === "plan-1"), true);
+  assert.equal(compacted.items.at(-1)?.id, "command-29");
   assert.ok(compacted.items.length <= 24);
 });
 

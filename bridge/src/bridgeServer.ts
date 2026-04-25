@@ -57,7 +57,11 @@ import {
   type RuntimeOutputTail,
 } from "./runtimeLaunchRegistry.js";
 import { sessionLaunchOptionsForBackend } from "./sessionLaunchConfig.js";
-import { captureSimulatorScreenshot, listBootedSimulators } from "./simulatorMirror.js";
+import {
+  captureSimulatorScreenshot,
+  listBootedSimulators,
+  listSimulatorAccessibilityElements,
+} from "./simulatorMirror.js";
 import { extractReadableText } from "./threadTextExtraction.js";
 import { ThreadControllerRegistry } from "./threadControllerRegistry.js";
 import { UnavailableBackend } from "./unavailableBackend.js";
@@ -103,6 +107,48 @@ type PendingApprovalRecord = PendingApproval & {
   backendId: string;
   method: string;
 };
+
+export type GitBranchStatus = {
+  cwd: string;
+  isRepository: boolean;
+  currentBranch: string | null;
+  branches: string[];
+};
+
+function runGit(cwd: string, args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function requireGitCwd(cwd: unknown): string {
+  const value = typeof cwd === "string" ? cwd.trim() : "";
+  if (!value) {
+    throw new HttpError(400, "Missing cwd");
+  }
+  return value;
+}
+
+export function readGitBranchStatus(cwd: string): GitBranchStatus {
+  try {
+    const isRepository = runGit(cwd, ["rev-parse", "--is-inside-work-tree"]) === "true";
+    if (!isRepository) {
+      return { cwd, isRepository: false, currentBranch: null, branches: [] };
+    }
+  } catch {
+    return { cwd, isRepository: false, currentBranch: null, branches: [] };
+  }
+
+  const currentBranch = runGit(cwd, ["branch", "--show-current"]) || null;
+  const branches = runGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+    .split("\n")
+    .map((branch) => branch.trim())
+    .filter(Boolean)
+    .sort((lhs, rhs) => lhs.localeCompare(rhs));
+
+  return { cwd, isRepository: true, currentBranch, branches };
+}
 
 type CachedThreadSummaryRecord = {
   thread: ThreadSummary;
@@ -350,6 +396,24 @@ export class BridgeServer {
       }
     });
 
+    this.app.get("/api/simulator/accessibility", async (_req, res) => {
+      try {
+        const snapshot = await listSimulatorAccessibilityElements();
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        res.json(snapshot);
+      } catch (error) {
+        this.handleError(
+          res,
+          error instanceof HttpError
+            ? error
+            : new HttpError(
+                500,
+                `Failed to read simulator accessibility tree: ${error instanceof Error ? error.message : String(error)}`
+              )
+        );
+      }
+    });
+
     this.app.get("/api/media/image", async (req, res) => {
       try {
         const image = await this.readLocalImageMedia(req.query.path);
@@ -408,7 +472,38 @@ export class BridgeServer {
         place-items: center;
         padding: 14px;
       }
+      .toolbar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      label {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+        color: rgba(245,247,250,0.84);
+        font-size: 12px;
+        user-select: none;
+      }
+      button {
+        appearance: none;
+        border: 1px solid rgba(255,255,255,0.18);
+        border-radius: 999px;
+        background: rgba(255,255,255,0.07);
+        color: #f5f7fa;
+        padding: 5px 10px;
+        font: inherit;
+        font-size: 12px;
+      }
+      .stage {
+        position: relative;
+        max-width: min(100%, 540px);
+        max-height: calc(100vh - 72px);
+      }
       img {
+        display: block;
         max-width: min(100%, 540px);
         max-height: calc(100vh - 72px);
         width: auto;
@@ -416,6 +511,57 @@ export class BridgeServer {
         border-radius: 18px;
         box-shadow: 0 18px 60px rgba(0,0,0,0.45);
         background: #11161b;
+      }
+      #overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: auto;
+        border-radius: 18px;
+        overflow: hidden;
+      }
+      .ax-box {
+        position: absolute;
+        border: 0;
+        background: transparent;
+        border-radius: 4px;
+        box-sizing: border-box;
+        cursor: crosshair;
+        padding: 0;
+      }
+      #overlay.debug .ax-box {
+        border: 1.5px solid rgba(0, 145, 255, 0.82);
+        background: rgba(0, 145, 255, 0.12);
+      }
+      #overlay.debug .ax-box[data-role="AXButton"],
+      #overlay.debug .ax-box[data-role="AXTextField"] {
+        border-color: rgba(255, 166, 0, 0.9);
+        background: rgba(255, 166, 0, 0.13);
+      }
+      #overlay.debug .ax-box.selected {
+        border-color: #46f58a;
+        background: rgba(70, 245, 138, 0.18);
+        box-shadow: 0 0 0 2px rgba(70, 245, 138, 0.42);
+      }
+      #selection {
+        position: fixed;
+        left: 14px;
+        bottom: 14px;
+        max-width: min(560px, calc(100vw - 28px));
+        padding: 10px 12px;
+        border: 1px solid rgba(255,255,255,0.16);
+        border-radius: 12px;
+        background: rgba(12, 15, 18, 0.92);
+        box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+        color: #f5f7fa;
+        display: none;
+      }
+      #selection.visible {
+        display: block;
+      }
+      #selection code {
+        color: #72c7ff;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
       }
       .error {
         color: #ff8a80;
@@ -428,18 +574,37 @@ export class BridgeServer {
         <div><strong>Helm Simulator Mirror</strong></div>
         <div id="meta">Loading…</div>
       </div>
-      <div id="status"></div>
+      <div class="toolbar">
+        <label><input id="debugTargets" type="checkbox" /> Show targets</label>
+        <button id="reloadAx" type="button">Refresh AX</button>
+        <div id="status"></div>
+      </div>
     </header>
     <main>
-      <img id="frame" alt="Booted iOS Simulator" />
+      <div class="stage">
+        <img id="frame" alt="Booted iOS Simulator" />
+        <div id="overlay" aria-label="Native simulator annotation targets"></div>
+      </div>
     </main>
+    <aside id="selection"></aside>
     <script>
       const token = ${tokenLiteral};
       const requestedUDID = ${selectedUDIDLiteral};
       const frame = document.getElementById("frame");
+      const overlay = document.getElementById("overlay");
+      const debugTargets = document.getElementById("debugTargets");
+      const reloadAx = document.getElementById("reloadAx");
+      const selection = document.getElementById("selection");
       const meta = document.getElementById("meta");
       const status = document.getElementById("status");
       let activeUDID = requestedUDID;
+      let axElements = [];
+      let selectedElementID = null;
+      let axRefreshInFlight = false;
+      let lastAxRefreshAt = 0;
+      const params = new URLSearchParams(window.location.search);
+      const annotateTargetsEnabled = params.get("inspect") === "1" || params.get("annotate") === "1";
+      debugTargets.checked = params.get("debug") === "1";
 
       async function refreshMeta() {
         const url = new URL("/api/simulator/booted", window.location.origin);
@@ -461,10 +626,90 @@ export class BridgeServer {
         frame.src = url.toString();
       }
 
+      async function refreshAccessibility() {
+        if (axRefreshInFlight) return;
+        axRefreshInFlight = true;
+        const url = new URL("/api/simulator/accessibility", window.location.origin);
+        url.searchParams.set("token", token);
+        try {
+          const response = await fetch(url, { cache: "no-store" });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || "Failed to load accessibility tree.");
+          axElements = Array.isArray(payload.elements) ? payload.elements : [];
+          lastAxRefreshAt = Date.now();
+          renderOverlay();
+        } finally {
+          axRefreshInFlight = false;
+        }
+      }
+
+      async function refreshAccessibilityIfStale() {
+        if (!annotateTargetsEnabled || Date.now() - lastAxRefreshAt < 2000) return;
+        await refreshAccessibility();
+      }
+
+      function renderOverlay() {
+        overlay.classList.toggle("debug", debugTargets.checked);
+        overlay.replaceChildren();
+        if (!annotateTargetsEnabled) return;
+
+        for (const element of axElements) {
+          const frame = element.normalizedFrame;
+          if (!frame) continue;
+          const box = document.createElement("button");
+          box.type = "button";
+          box.className = "ax-box" + (element.id === selectedElementID ? " selected" : "");
+          box.dataset.role = element.role || "";
+          box.style.left = (frame.x * 100).toFixed(4) + "%";
+          box.style.top = (frame.y * 100).toFixed(4) + "%";
+          box.style.width = (frame.width * 100).toFixed(4) + "%";
+          box.style.height = (frame.height * 100).toFixed(4) + "%";
+          box.title = elementSummary(element);
+          box.setAttribute("aria-label", elementSummary(element));
+          box.dataset.helmAxId = element.id;
+          box.dataset.helmAxRole = element.role || "";
+          box.dataset.helmAxLabel = elementSummary(element);
+          box.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            selectedElementID = element.id;
+            showSelection(element);
+            renderOverlay();
+          });
+          overlay.appendChild(box);
+        }
+      }
+
+      function elementSummary(element) {
+        return [
+          element.role,
+          element.description,
+          element.name,
+        ].filter(Boolean).join(" • ");
+      }
+
+      function showSelection(element) {
+        selection.classList.add("visible");
+        selection.innerHTML = [
+          "<strong>Selected native element</strong>",
+          "<div><code>" + escapeHTML(elementSummary(element)) + "</code></div>",
+          "<div>frame <code>" + escapeHTML(JSON.stringify(element.normalizedFrame)) + "</code></div>",
+        ].join("");
+      }
+
+      function escapeHTML(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+      }
+
       async function tick() {
         try {
           await refreshMeta();
           await refreshFrame();
+          await refreshAccessibilityIfStale();
           status.textContent = "live";
           status.className = "";
         } catch (error) {
@@ -473,6 +718,18 @@ export class BridgeServer {
         }
       }
 
+      debugTargets.addEventListener("change", () => {
+        selection.classList.toggle("visible", Boolean(selectedElementID) && debugTargets.checked);
+        renderOverlay();
+      });
+      reloadAx.addEventListener("click", () => {
+        if (annotateTargetsEnabled) {
+          void refreshAccessibility().catch((error) => {
+            status.textContent = error instanceof Error ? error.message : String(error);
+            status.className = "error";
+          });
+        }
+      });
       tick();
       setInterval(tick, 500);
     </script>
@@ -635,6 +892,38 @@ export class BridgeServer {
         res.json({
           options: sessionLaunchOptionsForBackend(backend.summary.id),
         });
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
+    this.app.get("/api/git/branches", (req, res) => {
+      try {
+        const cwd = requireGitCwd(req.query.cwd);
+        res.json({ status: readGitBranchStatus(cwd) });
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
+    this.app.post("/api/git/branch", (req, res) => {
+      try {
+        const cwd = requireGitCwd(req.body?.cwd);
+        const branch = typeof req.body?.branch === "string" ? req.body.branch.trim() : "";
+        if (!branch) {
+          throw new HttpError(400, "Missing branch");
+        }
+
+        const status = readGitBranchStatus(cwd);
+        if (!status.isRepository) {
+          throw new HttpError(400, "Working directory is not a git repository");
+        }
+        if (!status.branches.includes(branch)) {
+          throw new HttpError(400, `Unknown local branch '${branch}'`);
+        }
+
+        runGit(cwd, ["switch", branch]);
+        res.json({ status: readGitBranchStatus(cwd) });
       } catch (error) {
         this.handleError(res, error);
       }
@@ -3775,6 +4064,13 @@ export class BridgeServer {
     const firstUserMessageIndex = turn.items.findIndex((item) => item.type === "userMessage");
     if (firstUserMessageIndex >= 0) {
       addItemAtIndex(firstUserMessageIndex);
+    }
+
+    for (let index = turn.items.length - 1; index >= 0; index -= 1) {
+      if (turn.items[index]?.type === "plan") {
+        addItemAtIndex(index);
+        break;
+      }
     }
 
     for (let index = turn.items.length - 1; index >= 0; index -= 1) {
