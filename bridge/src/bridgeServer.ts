@@ -14,7 +14,7 @@ import { CommandModeDriver } from "./commandModeDriver.js";
 import { config } from "./config.js";
 import { ClaudeCodeBackend } from "./claudeCodeBackend.js";
 import { CodexBackend } from "./codexBackend.js";
-import { listCodexAutomations } from "./codexAutomations.js";
+import { createCodexAutomation, listCodexAutomations } from "./codexAutomations.js";
 import {
   canonicalCodexThreadId,
   deleteCodexThreadReplacement,
@@ -72,6 +72,7 @@ import type {
   BackendSummary,
   ConversationEvent,
   ControlRequest,
+  CreateCodexAutomationRequest,
   JSONValue,
   PendingApproval,
   RuntimePhase,
@@ -768,6 +769,34 @@ export class BridgeServer {
         });
       } catch (error) {
         this.handleError(res, error);
+      }
+    });
+
+    this.app.post("/api/automations", async (req, res) => {
+      try {
+        const automation = await createCodexAutomation({
+          name: typeof req.body?.name === "string" ? req.body.name : "",
+          prompt: typeof req.body?.prompt === "string" ? req.body.prompt : "",
+          rrule: typeof req.body?.rrule === "string" ? req.body.rrule : "",
+          model: typeof req.body?.model === "string" ? req.body.model : null,
+          reasoningEffort:
+            typeof req.body?.reasoningEffort === "string"
+              ? req.body.reasoningEffort
+              : typeof req.body?.reasoning_effort === "string"
+                ? req.body.reasoning_effort
+                : null,
+          executionEnvironment:
+            typeof req.body?.executionEnvironment === "string"
+              ? req.body.executionEnvironment
+              : typeof req.body?.execution_environment === "string"
+                ? req.body.execution_environment
+                : null,
+          cwd: typeof req.body?.cwd === "string" ? req.body.cwd : null,
+          status: typeof req.body?.status === "string" ? req.body.status : null,
+        } satisfies CreateCodexAutomationRequest);
+        res.status(201).json({ automation });
+      } catch (error) {
+        this.handleError(res, error instanceof Error ? new HttpError(400, error.message) : error);
       }
     });
 

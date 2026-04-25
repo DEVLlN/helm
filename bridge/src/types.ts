@@ -151,6 +151,17 @@ export type CodexAutomationSummary = {
   sourcePath: string;
 };
 
+export type CreateCodexAutomationRequest = {
+  name: string;
+  prompt: string;
+  rrule: string;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  executionEnvironment?: string | null;
+  cwd?: string | null;
+  status?: string | null;
+};
+
 export type ConversationEvent = {
   method: string;
   params?: JSONValue;

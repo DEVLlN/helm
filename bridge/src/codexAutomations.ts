@@ -1,8 +1,8 @@
-import { readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
-import type { CodexAutomationSummary } from "./types.js";
+import type { CodexAutomationSummary, CreateCodexAutomationRequest } from "./types.js";
 
 type TomlValue = string | number | string[];
 
@@ -212,6 +212,55 @@ export async function listCodexAutomations(): Promise<CodexAutomationSummary[]> 
   return automations.sort(automationPrecedes);
 }
 
+export async function createCodexAutomation(input: CreateCodexAutomationRequest): Promise<CodexAutomationSummary> {
+  const name = input.name.trim();
+  const prompt = input.prompt.trim();
+  const rrule = input.rrule.trim();
+  if (!name) {
+    throw new Error("Automation name is required");
+  }
+  if (!prompt) {
+    throw new Error("Automation prompt is required");
+  }
+  if (!rrule) {
+    throw new Error("Automation schedule is required");
+  }
+
+  const root = codexAutomationsDir();
+  await mkdir(root, { recursive: true });
+
+  const id = await uniqueAutomationId(root, slugify(name));
+  const automationDir = path.join(root, id);
+  await mkdir(automationDir, { recursive: false });
+
+  const now = Date.now();
+  const status = normalizedStatus(input.status);
+  const content = [
+    "version = 1",
+    `id = ${tomlString(id)}`,
+    `kind = "cron"`,
+    `name = ${tomlString(name)}`,
+    `prompt = ${tomlString(prompt)}`,
+    `status = ${tomlString(status)}`,
+    `rrule = ${tomlString(rrule)}`,
+    optionalTomlString("model", input.model),
+    optionalTomlString("reasoning_effort", input.reasoningEffort),
+    optionalTomlString("execution_environment", input.executionEnvironment),
+    `cwds = ${tomlStringArray(input.cwd?.trim() ? [input.cwd.trim()] : [])}`,
+    `created_at = ${now}`,
+    `updated_at = ${now}`,
+    "",
+  ].filter((line): line is string => line !== null).join("\n");
+
+  const sourcePath = path.join(automationDir, "automation.toml");
+  await writeFile(sourcePath, content, { encoding: "utf8", flag: "wx" });
+  const automation = parseCodexAutomationToml(content, sourcePath);
+  if (!automation) {
+    throw new Error("Created automation could not be parsed");
+  }
+  return automation;
+}
+
 function automationPrecedes(lhs: CodexAutomationSummary, rhs: CodexAutomationSummary): number {
   const lhsActive = lhs.status.toUpperCase() === "ACTIVE";
   const rhsActive = rhs.status.toUpperCase() === "ACTIVE";
@@ -312,6 +361,51 @@ function promptPreview(prompt: string): string {
     return compact;
   }
   return `${compact.slice(0, 177).trimEnd()}...`;
+}
+
+async function uniqueAutomationId(root: string, base: string): Promise<string> {
+  const cleanBase = base || "automation";
+  for (let suffix = 0; suffix < 100; suffix += 1) {
+    const id = suffix === 0 ? cleanBase : `${cleanBase}-${suffix + 1}`;
+    try {
+      await readFile(path.join(root, id, "automation.toml"), "utf8");
+    } catch {
+      return id;
+    }
+  }
+  return `${cleanBase}-${Date.now()}`;
+}
+
+function slugify(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function normalizedStatus(value: string | null | undefined): string {
+  const trimmed = value?.trim().toUpperCase();
+  return trimmed === "PAUSED" ? "PAUSED" : "ACTIVE";
+}
+
+function optionalTomlString(key: string, value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? `${key} = ${tomlString(trimmed)}` : null;
+}
+
+function tomlString(value: string): string {
+  return `"${value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, "\\\"")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t")}"`;
+}
+
+function tomlStringArray(values: string[]): string {
+  return `[${values.map(tomlString).join(", ")}]`;
 }
 
 function stringValue(value: TomlValue | undefined): string | null {

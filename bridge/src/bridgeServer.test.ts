@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { BridgeServer, readGitBranchStatus } from "./bridgeServer.js";
-import { listCodexAutomations, parseCodexAutomationToml } from "./codexAutomations.js";
+import { createCodexAutomation, listCodexAutomations, parseCodexAutomationToml } from "./codexAutomations.js";
 import type {
   BackendSummary,
   JSONValue,
@@ -340,6 +340,39 @@ updated_at = 100
     assert.deepEqual(
       (await listCodexAutomations()).map((automation) => automation.id),
       ["active-task", "paused-task"]
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CODEX_AUTOMATIONS_DIR;
+    } else {
+      process.env.CODEX_AUTOMATIONS_DIR = previous;
+    }
+  }
+});
+
+test("Codex automation creation writes parseable automation files", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "helm-create-automation-"));
+  const previous = process.env.CODEX_AUTOMATIONS_DIR;
+  process.env.CODEX_AUTOMATIONS_DIR = root;
+  try {
+    const automation = await createCodexAutomation({
+      name: "Daily mobile audit",
+      prompt: "Check the mobile app.",
+      rrule: "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      model: "gpt-5.4",
+      reasoningEffort: "medium",
+      executionEnvironment: "local",
+      cwd: "/Users/devlin/GitHub/helm-dev",
+      status: "ACTIVE",
+    });
+
+    assert.equal(automation.id, "daily-mobile-audit");
+    assert.equal(automation.name, "Daily mobile audit");
+    assert.equal(automation.scheduleSummary, "Daily at 9:00 AM");
+    assert.equal(automation.cwd, "/Users/devlin/GitHub/helm-dev");
+    assert.deepEqual(
+      (await listCodexAutomations()).map((entry) => entry.id),
+      ["daily-mobile-audit"]
     );
   } finally {
     if (previous === undefined) {
