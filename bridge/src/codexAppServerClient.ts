@@ -2326,6 +2326,48 @@ export class CodexAppServerClient extends EventEmitter {
     }
   }
 
+  async setModelAndReasoning(
+    threadId: string,
+    model: string,
+    reasoningEffort: string | null = null
+  ): Promise<JSONValue | undefined> {
+    const trimmedModel = model.trim();
+    if (!trimmedModel) {
+      throw new Error("Missing model");
+    }
+
+    const thread = await this.loadThreadDeliverySummary(threadId);
+    if (!thread) {
+      throw new Error(`thread not found: ${threadId}`);
+    }
+    if (!codexSourceKindUsesSharedDesktopSurface(thread.sourceKind)) {
+      throw new Error("Direct model and reasoning updates require a shared Codex app session.");
+    }
+
+    return await this.setModelAndReasoningViaCodexDesktopIpc(
+      threadId,
+      trimmedModel,
+      reasoningEffort?.trim() || null
+    );
+  }
+
+  private async setModelAndReasoningViaCodexDesktopIpc(
+    threadId: string,
+    model: string,
+    reasoningEffort: string | null
+  ): Promise<JSONValue | undefined> {
+    if (!isCodexDesktopIpcAvailable()) {
+      throw new Error(`Codex Desktop IPC socket is not available at ${codexDesktopIpcSocketPath()}`);
+    }
+
+    const client = new CodexDesktopIpcClient();
+    try {
+      return await client.setModelAndReasoning(threadId, model, reasoningEffort);
+    } finally {
+      client.dispose();
+    }
+  }
+
   private async interruptTurnViaCodexDesktopIpc(threadId: string): Promise<JSONValue | undefined> {
     if (!isCodexDesktopIpcAvailable()) {
       throw new Error(`Codex Desktop IPC socket is not available at ${codexDesktopIpcSocketPath()}`);

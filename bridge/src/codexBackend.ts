@@ -106,6 +106,14 @@ export class CodexBackend extends AgentBackend {
     return await this.transport.startTurn(threadId, text, options);
   }
 
+  async setModelAndReasoning(
+    threadId: string,
+    model: string,
+    reasoningEffort: string | null = null
+  ): Promise<JSONValue | undefined> {
+    return await this.transport.setModelAndReasoning(threadId, model, reasoningEffort);
+  }
+
   async interruptTurn(threadId: string): Promise<JSONValue | undefined> {
     return await this.transport.interruptTurn(threadId);
   }

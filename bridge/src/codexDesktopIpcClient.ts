@@ -15,6 +15,7 @@ const REQUEST_VERSIONS = new Map<string, number>([
   ["thread-follower-start-turn", 1],
   ["thread-follower-steer-turn", 1],
   ["thread-follower-interrupt-turn", 1],
+  ["thread-follower-set-model-and-reasoning", 1],
   ["thread-follower-set-queued-follow-ups-state", 1],
   ["thread-queued-followups-changed", 1],
 ]);
@@ -168,6 +169,18 @@ export class CodexDesktopIpcClient {
   async interruptTurn(threadId: string): Promise<JSONValue | undefined> {
     return await this.request("thread-follower-interrupt-turn", {
       conversationId: threadId,
+    });
+  }
+
+  async setModelAndReasoning(
+    threadId: string,
+    model: string,
+    reasoningEffort: string | null
+  ): Promise<JSONValue | undefined> {
+    return await this.request("thread-follower-set-model-and-reasoning", {
+      conversationId: threadId,
+      model,
+      reasoningEffort,
     });
   }
 

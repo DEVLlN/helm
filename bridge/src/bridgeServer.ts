@@ -1218,6 +1218,35 @@ export class BridgeServer {
       }
     });
 
+    this.app.post("/api/threads/:threadId/model", async (req, res) => {
+      try {
+        const canonicalThreadId = this.canonicalThreadId(req.params.threadId);
+        const model = String(req.body?.model ?? "").trim();
+        if (!model) {
+          res.status(400).json({ error: "Missing model" });
+          return;
+        }
+
+        const rawReasoningEffort = req.body?.reasoningEffort;
+        const reasoningEffort =
+          typeof rawReasoningEffort === "string" && rawReasoningEffort.trim()
+            ? rawReasoningEffort.trim()
+            : null;
+        this.ensureThreadControlForCommand(canonicalThreadId, req.body);
+        const backend = this.backendForThread(canonicalThreadId);
+        if (!(backend instanceof CodexBackend)) {
+          res.status(501).json({ error: "Model and reasoning updates are only wired for Codex sessions." });
+          return;
+        }
+
+        const result = await backend.setModelAndReasoning(canonicalThreadId, model, reasoningEffort);
+        this.scheduleThreadDetailBroadcastBurst(canonicalThreadId);
+        res.json(result ?? { ok: true });
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
     this.app.post("/api/threads/:threadId/input", async (req, res) => {
       try {
         const canonicalThreadId = this.canonicalThreadId(req.params.threadId);

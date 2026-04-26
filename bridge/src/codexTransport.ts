@@ -63,6 +63,11 @@ export interface CodexTransport {
     text: string,
     options?: StartTurnOptions
   ): Promise<JSONValue | undefined>;
+  setModelAndReasoning(
+    threadId: string,
+    model: string,
+    reasoningEffort?: string | null
+  ): Promise<JSONValue | undefined>;
   interruptTurn(threadId: string): Promise<JSONValue | undefined>;
   sendInput(threadId: string, input: string): Promise<JSONValue | undefined>;
   renameThread(threadId: string, name: string): Promise<JSONValue | undefined>;
@@ -142,6 +147,14 @@ export class CodexAppServerTransport implements CodexTransport {
     options: StartTurnOptions = {}
   ): Promise<JSONValue | undefined> {
     return await this.client.startTurn(threadId, text, options);
+  }
+
+  async setModelAndReasoning(
+    threadId: string,
+    model: string,
+    reasoningEffort: string | null = null
+  ): Promise<JSONValue | undefined> {
+    return await this.client.setModelAndReasoning(threadId, model, reasoningEffort);
   }
 
   async interruptTurn(threadId: string): Promise<JSONValue | undefined> {

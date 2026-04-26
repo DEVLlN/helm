@@ -100,6 +100,11 @@ type CodexClientPrivateHooks = {
   shouldStartViaAppServer(threadId: string): Promise<boolean>;
   shouldPreferCLIResumeFallback(threadId: string): Promise<boolean>;
   shouldPreferShellRelayFirst(threadId: string): Promise<boolean>;
+  setModelAndReasoningViaCodexDesktopIpc(
+    threadId: string,
+    model: string,
+    reasoningEffort: string | null
+  ): Promise<JSONValue | undefined>;
   enqueueTurnViaCodexDesktopIpc(
     threadId: string,
     text: string,
@@ -399,6 +404,48 @@ test("queued Codex desktop turn keeps queue mode when an image is attached", asy
     mode: "codexDesktopIpcQueuedFollowUpBroadcast",
     threadId: "thread-1",
   });
+});
+
+test("Codex desktop model update uses direct IPC for shared desktop threads", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  let ipcCall: { threadId: string; model: string; reasoningEffort: string | null } | null = null;
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "vscode",
+    status: "idle",
+  });
+  hooks.setModelAndReasoningViaCodexDesktopIpc = async (threadId, model, reasoningEffort) => {
+    ipcCall = { threadId, model, reasoningEffort };
+    return { ok: true };
+  };
+
+  const result = await client.setModelAndReasoning("thread-1", " gpt-5.5 ", " high ");
+
+  assert.deepEqual(ipcCall, {
+    threadId: "thread-1",
+    model: "gpt-5.5",
+    reasoningEffort: "high",
+  });
+  assert.deepEqual(result, { ok: true });
+});
+
+test("Codex model update rejects non-shared desktop threads", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "cli",
+    status: "idle",
+  });
+  hooks.setModelAndReasoningViaCodexDesktopIpc = async () => {
+    throw new Error("direct IPC should not run for CLI threads");
+  };
+
+  await assert.rejects(
+    () => client.setModelAndReasoning("thread-1", "gpt-5.5", "high"),
+    /shared Codex app session/
+  );
 });
 
 test("Codex desktop queued follow-up append coalesces immediate duplicate messages", () => {
