@@ -603,6 +603,62 @@ test("Codex oversized thread reads prefer turnless app-server metadata before st
   );
 });
 
+test("Codex desktop session reads prefer local rollout turns before oversized app-server payloads", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+
+  hooks.localThreadReadFallback = async (threadId: string, includeTurns: boolean) => ({
+    thread: {
+      id: threadId,
+      name: "Desktop thread",
+      preview: "local rollout preview",
+      cwd: "/tmp/project",
+      status: "idle",
+      updatedAt: 456_000,
+      sourceKind: "vscode",
+      ...(includeTurns
+        ? {
+            turns: [
+              {
+                id: "turn-1",
+                status: "completed",
+                items: [
+                  {
+                    id: "item-1",
+                    type: "agentMessage",
+                    text: "local rollout text",
+                  },
+                ],
+              },
+            ],
+          }
+        : {}),
+    },
+  });
+  hooks.request = async (method: string, params?: JSONValue) => {
+    requestCalls.push({ method, params });
+    throw new Error("app-server thread/read should not be called");
+  };
+
+  const result = await client.readThread("thread-1", {
+    allowTurnlessFallback: true,
+  });
+  const thread = result && typeof result === "object" && !Array.isArray(result)
+    ? result.thread
+    : null;
+
+  assert.deepEqual(requestCalls, []);
+  assert.equal(
+    thread && typeof thread === "object" && !Array.isArray(thread)
+      ? Array.isArray(thread.turns)
+        ? thread.turns.length
+        : 0
+      : 0,
+    1
+  );
+});
+
 test("Codex thread list merge prefers discovered prompt over degraded remote Helm title", () => {
   const client = new CodexAppServerClient("ws://127.0.0.1:0");
   const hooks = client as unknown as CodexClientPrivateHooks;

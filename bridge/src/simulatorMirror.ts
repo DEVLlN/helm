@@ -326,7 +326,8 @@ func childElements(_ element: AXUIElement) -> [AXUIElement] {
   for attribute in [kAXVisibleChildrenAttribute as CFString, kAXChildrenAttribute as CFString] {
     var value: CFTypeRef?
     if AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
-       let children = value as? [AXUIElement] {
+       let children = value as? [AXUIElement],
+       !children.isEmpty {
       return children
     }
   }

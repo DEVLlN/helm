@@ -1343,7 +1343,7 @@ export class CodexAppServerClient extends EventEmitter {
     const sourceKind = typeof thread.sourceKind === "string"
       ? thread.sourceKind.trim().toLowerCase()
       : "";
-    return sourceKind === "cli" && this.threadReadHasTurns(value);
+    return (sourceKind === "cli" || sourceKind === "vscode") && this.threadReadHasTurns(value);
   }
 
   private async fullerLocalThreadReadFallback(

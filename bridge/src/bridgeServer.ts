@@ -752,6 +752,22 @@ export class BridgeServer {
       });
     });
 
+    this.app.get("/assets/realtime-command-runtime.js", async (_req, res) => {
+      try {
+        const source = await readFile(this.realtimeCommandRuntimeAssetPath(), "utf8");
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        res.type("application/javascript; charset=utf-8").send(source);
+      } catch (error) {
+        this.handleError(
+          res,
+          new HttpError(
+            500,
+            `Realtime Command runtime has not been built: ${error instanceof Error ? error.message : String(error)}`
+          )
+        );
+      }
+    });
+
     this.app.get("/api/command-mode", async (_req, res) => {
       try {
         const provider = this.voiceProviders.get(this.defaultVoiceProviderId);
@@ -1461,6 +1477,49 @@ export class BridgeServer {
       }
     });
 
+    this.app.post("/api/realtime/voice-component-session", async (req, res) => {
+      try {
+        const style = typeof req.query.style === "string" ? req.query.style : undefined;
+        const backend = this.backendForCommandRequest(req.query);
+        this.ensureBackendSupportsRealtimeVoice(backend);
+        const provider = await this.voiceProviderForRequest({
+          voiceProviderId: typeof req.query.voiceProviderId === "string" ? req.query.voiceProviderId : undefined,
+          style,
+        });
+        const summary = await provider.getSummary();
+        if (summary.transport !== "openai-webrtc" && summary.transport !== "openai-webrtc+nvidia-tts") {
+          throw new HttpError(
+            501,
+            `${summary.label} does not support the OpenAI realtime voice component transport`
+          );
+        }
+
+        const contentType = req.header("content-type");
+        const realtimeRequestInit = {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.requireOpenAIKey()}`,
+            ...(contentType ? { "Content-Type": contentType } : {}),
+          },
+          body: req as unknown as BodyInit,
+          duplex: "half",
+        } as unknown as RequestInit;
+        const realtimeResponse = await fetch(
+          "https://api.openai.com/v1/realtime/calls",
+          realtimeRequestInit
+        );
+
+        const body = await realtimeResponse.text();
+        res.setHeader("X-Helm-Voice-Provider-Id", summary.id);
+        res
+          .status(realtimeResponse.status)
+          .type(realtimeResponse.headers.get("content-type") ?? "application/sdp")
+          .send(body);
+      } catch (error) {
+        this.handleError(res, error);
+      }
+    });
+
     this.app.post(
       "/api/realtime/session",
       express.text({ type: ["application/sdp", "text/plain"] }),
@@ -1563,6 +1622,10 @@ export class BridgeServer {
       suggestedBridgeURLs,
       setupURL,
     };
+  }
+
+  private realtimeCommandRuntimeAssetPath(): string {
+    return path.resolve(process.cwd(), "dist", "realtime-command-runtime.js");
   }
 
   private resolveDefaultVoiceProviderId(): string {
