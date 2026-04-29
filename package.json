@@ -1,6 +1,6 @@
 {
   "name": "@devlln/helm",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": false,
   "description": "Helm CLI bridge installer and runtime helpers.",
   "homepage": "https://github.com/DEVLlN/helm#readme",
@@ -46,6 +46,7 @@
     "scripts/install-helm-shell-integration.sh",
     "scripts/install-helm.sh",
     "scripts/bridge-service.sh",
+    "scripts/bridge-service-runner.sh",
     "scripts/print-pairing-qr.sh",
     "scripts/prototype-down.sh",
     "scripts/prototype-status.sh",

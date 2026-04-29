@@ -1194,7 +1194,7 @@ export class BridgeServer {
           return;
         }
 
-        this.ensureThreadControlForCommand(canonicalThreadId, req.body);
+        this.ensureThreadControlForCommand(canonicalThreadId, this.controlRequestFromRequest(req));
         const deliveryMode = this.turnDeliveryModeFromRequest(req.body);
         const backend = this.backendForThread(canonicalThreadId);
         console.log(
@@ -1224,7 +1224,7 @@ export class BridgeServer {
     this.app.post("/api/threads/:threadId/interrupt", async (req, res) => {
       try {
         const canonicalThreadId = this.canonicalThreadId(req.params.threadId);
-        this.ensureThreadControlForCommand(canonicalThreadId, req.body);
+        this.ensureThreadControlForCommand(canonicalThreadId, this.controlRequestFromRequest(req));
         const backend = this.backendForThread(canonicalThreadId);
         const result = await backend.interruptTurn(canonicalThreadId);
         this.scheduleThreadDetailBroadcastBurst(canonicalThreadId);
@@ -1248,7 +1248,7 @@ export class BridgeServer {
           typeof rawReasoningEffort === "string" && rawReasoningEffort.trim()
             ? rawReasoningEffort.trim()
             : null;
-        this.ensureThreadControlForCommand(canonicalThreadId, req.body);
+        this.ensureThreadControlForCommand(canonicalThreadId, this.controlRequestFromRequest(req));
         const backend = this.backendForThread(canonicalThreadId);
         if (!(backend instanceof CodexBackend)) {
           res.status(501).json({ error: "Model and reasoning updates are only wired for Codex sessions." });
@@ -1272,7 +1272,7 @@ export class BridgeServer {
           return;
         }
 
-        this.ensureThreadControlForCommand(canonicalThreadId, req.body);
+        this.ensureThreadControlForCommand(canonicalThreadId, this.controlRequestFromRequest(req));
         const backend = this.backendForThread(canonicalThreadId);
         const result = await backend.sendInput(canonicalThreadId, input);
         this.scheduleThreadDetailBroadcastBurst(canonicalThreadId);
@@ -1303,7 +1303,7 @@ export class BridgeServer {
     this.app.post("/api/threads/:threadId/control/take", async (req, res) => {
       try {
         const canonicalThreadId = this.canonicalThreadId(req.params.threadId);
-        const controller = this.claimThreadControl(canonicalThreadId, req.body as ControlRequest);
+        const controller = this.claimThreadControl(canonicalThreadId, this.controlRequestFromRequest(req));
         void this.broadcastControlChange(canonicalThreadId);
         res.json({ controller });
       } catch (error) {
@@ -1314,7 +1314,7 @@ export class BridgeServer {
     this.app.post("/api/threads/:threadId/control/release", async (req, res) => {
       try {
         const canonicalThreadId = this.canonicalThreadId(req.params.threadId);
-        this.releaseThreadControl(canonicalThreadId, req.body as ControlRequest);
+        this.releaseThreadControl(canonicalThreadId, this.controlRequestFromRequest(req));
         void this.broadcastControlChange(canonicalThreadId);
         res.json({ released: true });
       } catch (error) {
@@ -1408,7 +1408,7 @@ export class BridgeServer {
         }
 
         const canonicalThreadId = this.canonicalThreadId(body.threadId);
-        this.ensureThreadControlForCommand(canonicalThreadId, body);
+        this.ensureThreadControlForCommand(canonicalThreadId, this.controlRequestFromRequest(req));
         const backend = this.backendForThread(canonicalThreadId);
         this.ensureBackendSupportsVoiceCommand(backend);
         const result = await backend.startTurn(canonicalThreadId, text);
@@ -3211,6 +3211,35 @@ export class BridgeServer {
     }
 
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  private requestBodyStringValue(body: unknown, key: string): string | null {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return null;
+    }
+
+    const value = (body as Record<string, unknown>)[key];
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  private controlRequestFromRequest(req: express.Request): ControlRequest {
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+    const clientId =
+      this.requestBodyStringValue(body, "clientId")
+      ?? this.requestHeaderValue(req.headers["x-helm-client-id"])
+      ?? "";
+    const clientName =
+      this.requestBodyStringValue(body, "clientName")
+      ?? this.requestHeaderValue(req.headers["x-helm-client-name"])
+      ?? undefined;
+
+    return {
+      clientId,
+      clientName,
+      force: Boolean(body.force),
+    };
   }
 
   private numericHeaderValue(value: string | string[] | undefined): number | null {

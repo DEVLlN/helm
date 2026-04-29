@@ -10,6 +10,7 @@ LOG_DIR="$RUNTIME_DIR/logs"
 STDOUT_LOG="$LOG_DIR/helm-bridge-service.out.log"
 STDERR_LOG="$LOG_DIR/helm-bridge-service.err.log"
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
+RUNNER_PATH="$ROOT_DIR/scripts/bridge-service-runner.sh"
 GUI_DOMAIN="gui/$(id -u)"
 
 usage() {
@@ -68,15 +69,17 @@ render_plist() {
   <string>${SERVICE_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${NODE_BIN}</string>
-    <string>${BRIDGE_DIR}/dist/index.js</string>
+    <string>/bin/bash</string>
+    <string>${RUNNER_PATH}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${BRIDGE_DIR}</string>
+  <string>${ROOT_DIR}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>${path_value}</string>
+    <key>NODE_BIN</key>
+    <string>${NODE_BIN}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

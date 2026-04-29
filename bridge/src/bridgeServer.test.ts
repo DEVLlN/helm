@@ -75,6 +75,10 @@ type BridgeServerInternals = {
   withLiveRuntimeTail(detail: ThreadDetail, backendId: string): ThreadDetail;
   liveRuntimeOutputTailForThread(threadId: string, backendId: string): { updatedAt: number; text: string } | null;
   codexLocalThreadSnapshot(threadId: string): Promise<{ turns: JSONValue[]; updatedAt: number | null }>;
+  controlRequestFromRequest(req: {
+    body?: unknown;
+    headers: Record<string, string | string[] | undefined>;
+  }): { clientId: string; clientName?: string; force?: boolean };
 };
 
 function compactItem(item: ThreadDetailItem): ThreadDetailItem {
@@ -535,6 +539,46 @@ test("thread list preserves backend-provided controller metadata when no local o
   ]);
 
   assert.deepEqual(threads[0]?.controller, controller);
+});
+
+test("control request identity falls back to signed Helm headers", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+
+  const identity = server.controlRequestFromRequest({
+    body: {},
+    headers: {
+      "x-helm-client-id": "iphone-1",
+      "x-helm-client-name": "helm iPhone",
+    },
+  });
+
+  assert.deepEqual(identity, {
+    clientId: "iphone-1",
+    clientName: "helm iPhone",
+    force: false,
+  });
+});
+
+test("control request body identity takes precedence over Helm headers", () => {
+  const server = new BridgeServer() as unknown as BridgeServerInternals;
+
+  const identity = server.controlRequestFromRequest({
+    body: {
+      clientId: "body-client",
+      clientName: "Body Client",
+      force: true,
+    },
+    headers: {
+      "x-helm-client-id": "header-client",
+      "x-helm-client-name": "Header Client",
+    },
+  });
+
+  assert.deepEqual(identity, {
+    clientId: "body-client",
+    clientName: "Body Client",
+    force: true,
+  });
 });
 
 test("thread list enrichment fetches detail for generic summaries", async () => {
