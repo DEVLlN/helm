@@ -49,6 +49,20 @@ helm platforms
 helm platforms --json
 ```
 
+## Updates
+
+Published npm and Homebrew installs check for bridge updates automatically while the launchd bridge service is running. Local git checkouts do not auto-update unless `HELM_BRIDGE_AUTO_UPDATE=1` is set.
+
+Manual update commands:
+
+```bash
+helm update
+helm update --dry-run
+helm update --method homebrew
+helm update --method npm
+helm update --method git
+```
+
 Helm can detect:
 
 - Codex CLI

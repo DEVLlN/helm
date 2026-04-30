@@ -138,6 +138,12 @@ type CodexClientPrivateHooks = {
     },
     options?: { swallowErrors?: boolean }
   ): Promise<JSONValue | undefined>;
+  ensureAppServerThreadLoadedForDelivery(
+    threadId: string,
+    options?: { forceResume?: boolean }
+  ): Promise<void>;
+  canRefreshCodexDesktopThreadRoute(): boolean;
+  refreshCodexDesktopThreadRoute(threadId: string, reason?: string): Promise<boolean>;
   codexDesktopQueuedFollowUpsWithAppendedMessage(
     currentMessages: TestQueuedFollowUp[],
     message: TestQueuedFollowUp
@@ -356,10 +362,12 @@ test("queued idle Codex desktop turn starts immediately instead of becoming an i
   });
 });
 
-test("idle Codex desktop turn falls back to app-server when desktop IPC has no loaded client", async () => {
+test("idle Codex desktop turn falls back through app-server and refreshes Codex.app when desktop IPC has no loaded client", async () => {
   const client = new CodexAppServerClient("ws://127.0.0.1:0");
   const hooks = client as unknown as CodexClientPrivateHooks;
   const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+  const ensureCalls: Array<{ threadId: string; options?: { forceResume?: boolean } }> = [];
+  const refreshCalls: Array<{ threadId: string; reason?: string }> = [];
 
   hooks.loadThreadDeliverySummary = async () => ({
     sourceKind: "vscode",
@@ -382,9 +390,16 @@ test("idle Codex desktop turn falls back to app-server when desktop IPC has no l
   hooks.enqueueTurnViaCodexDesktopIpc = async () => {
     throw new Error("idle desktop sends should not queue a follow-up");
   };
+  hooks.ensureAppServerThreadLoadedForDelivery = async (threadId, options) => {
+    ensureCalls.push({ threadId, options });
+  };
+  hooks.canRefreshCodexDesktopThreadRoute = () => true;
+  hooks.refreshCodexDesktopThreadRoute = async (threadId, reason) => {
+    refreshCalls.push({ threadId, reason });
+    return true;
+  };
   hooks.request = async (method: string, params?: JSONValue) => {
     requestCalls.push({ method, params });
-    assert.equal(method, "turn/start");
     return {
       ok: true,
     };
@@ -394,7 +409,107 @@ test("idle Codex desktop turn falls back to app-server when desktop IPC has no l
     deliveryMode: "steer",
   });
 
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "appServerStartAfterDesktopIpcNoClientWithDesktopRefresh",
+    threadId: "thread-1",
+  });
+  assert.deepEqual(ensureCalls, [
+    { threadId: "thread-1", options: { forceResume: true } },
+  ]);
+  assert.equal(requestCalls.length, 1);
+  assert.equal(requestCalls[0]?.method, "turn/start");
+  assert.deepEqual(requestCalls[0]?.params, {
+    threadId: "thread-1",
+    input: [
+      {
+        type: "text",
+        text: "from mobile",
+        text_elements: [],
+      },
+    ],
+  });
+  assert.deepEqual(refreshCalls, [
+    { threadId: "thread-1", reason: "desktop-ipc-no-client" },
+  ]);
+});
+
+test("idle app-server thread loads and retries text start when direct start reports thread not loaded", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+  const ensureCalls: Array<{ threadId: string; options?: { forceResume?: boolean } }> = [];
+  let rejectedFirstTextStart = false;
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "appServer",
+    status: "idle",
+  });
+  hooks.readThreadDeliverySnapshot = async () => ({
+    hasTurnData: true,
+    turnCount: 0,
+    matchingUserTextCount: 0,
+    updatedAt: 123_000,
+    threadStatus: "idle",
+    activeTurnId: null,
+  });
+  hooks.steerTurnViaCodexDesktopIpc = async () => {
+    throw new Error("Codex Desktop IPC thread-follower-steer-turn failed: no-client-found");
+  };
+  hooks.startTurnViaCodexDesktopIpc = async () => {
+    throw new Error("Codex Desktop IPC thread-follower-start-turn failed: no-client-found");
+  };
+  hooks.shouldStartViaAppServer = async () => true;
+  hooks.shouldPreferCLIResumeFallback = async () => false;
+  hooks.shouldPreferShellRelayFirst = async () => false;
+  hooks.ensureAppServerThreadLoadedForDelivery = async (threadId, options) => {
+    ensureCalls.push({ threadId, options });
+  };
+  hooks.request = async (method: string, params?: JSONValue) => {
+    requestCalls.push({ method, params });
+    if (
+      !rejectedFirstTextStart
+      && requestCalls.length === 1
+      &&
+      method === "turn/start"
+      && params
+      && typeof params === "object"
+      && !Array.isArray(params)
+      && Array.isArray(params.input)
+      && params.input.length > 0
+    ) {
+      rejectedFirstTextStart = true;
+      throw new Error("thread not loaded: thread-1");
+    }
+    return {
+      ok: true,
+    };
+  };
+
+  const result = await client.startTurn("thread-1", "from mobile", {
+    deliveryMode: "steer",
+  });
+
+  assert.deepEqual(ensureCalls, [
+    {
+      threadId: "thread-1",
+      options: { forceResume: true },
+    },
+  ]);
   assert.deepEqual(requestCalls, [
+    {
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        input: [
+          {
+            type: "text",
+            text: "from mobile",
+            text_elements: [],
+          },
+        ],
+      },
+    },
     {
       method: "turn/start",
       params: {
@@ -411,7 +526,62 @@ test("idle Codex desktop turn falls back to app-server when desktop IPC has no l
   ]);
   assert.deepEqual(result, {
     ok: true,
-    mode: "appServerStartAfterDesktopIpcNoClient",
+    mode: "appServerStartAfterThreadLoadRetry",
+    threadId: "thread-1",
+  });
+});
+
+test("missing delivery summary still retries text start for unloaded app-server threads", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+  const ensureCalls: Array<{ threadId: string; options?: { forceResume?: boolean } }> = [];
+
+  hooks.loadThreadDeliverySummary = async () => null;
+  hooks.readThreadDeliverySnapshot = async () => null;
+  hooks.shouldStartViaAppServer = async () => true;
+  hooks.shouldPreferCLIResumeFallback = async () => false;
+  hooks.shouldPreferShellRelayFirst = async () => false;
+  hooks.ensureAppServerThreadLoadedForDelivery = async (threadId, options) => {
+    ensureCalls.push({ threadId, options });
+  };
+  hooks.request = async (method: string, params?: JSONValue) => {
+    requestCalls.push({ method, params });
+    if (method === "turn/start" && requestCalls.length === 1) {
+      throw new Error("thread not loaded: thread-1");
+    }
+    return {
+      ok: true,
+    };
+  };
+
+  const result = await client.startTurn("thread-1", "from mobile", {
+    deliveryMode: "steer",
+  });
+
+  assert.deepEqual(ensureCalls, [
+    {
+      threadId: "thread-1",
+      options: { forceResume: true },
+    },
+  ]);
+  assert.deepEqual(requestCalls.map((call) => call.method), [
+    "turn/start",
+    "turn/start",
+  ]);
+  assert.deepEqual(requestCalls[1]?.params, {
+    threadId: "thread-1",
+    input: [
+      {
+        type: "text",
+        text: "from mobile",
+        text_elements: [],
+      },
+    ],
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "appServerStartAfterThreadLoadRetry",
     threadId: "thread-1",
   });
 });

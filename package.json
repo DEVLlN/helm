@@ -1,6 +1,6 @@
 {
   "name": "@devlln/helm",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "private": false,
   "description": "Helm CLI bridge installer and runtime helpers.",
   "homepage": "https://github.com/DEVLlN/helm#readme",
@@ -36,6 +36,7 @@
     "scripts/helm-local-model-wrapper.sh",
     "scripts/helm-runtime-shim.sh",
     "scripts/helm-runtime-wrapper.sh",
+    "scripts/helm-update.sh",
     "scripts/helm_bootstrap_codex_thread.py",
     "scripts/helm_codex_wrapper_plan.py",
     "scripts/helm_ensure_managed_codex_thread.py",

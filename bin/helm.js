@@ -15,12 +15,14 @@ Usage:
   helm setup [setup options]
   helm bridge <setup|up|pair|status|down> [options]
   helm platforms [--json]
+  helm update [--method auto|npm|homebrew|git] [--dry-run]
   helm help [bridge]
 
 Commands:
   setup      Install Helm bridge helpers, enable runtime wrapping, configure Tailscale, start the bridge, and print pairing details.
   bridge     Manage the local Helm bridge runtime and pairing helpers.
   platforms  Detect the local runtimes, shell integration, Tailscale state, and Mac-app build support that Helm can use.
+  update     Update the installed Helm bridge package and restart the bridge service.
 
 Compatibility aliases:
   helm install  -> helm setup
@@ -28,6 +30,7 @@ Compatibility aliases:
   helm pair     -> helm bridge pair
   helm status   -> helm bridge status
   helm down     -> helm bridge down
+  helm upgrade  -> helm update
 
 Examples:
   helm setup
@@ -37,6 +40,7 @@ Examples:
   helm bridge pair --no-start
   helm platforms
   helm platforms --json
+  helm update --dry-run
 `);
 }
 
@@ -48,14 +52,18 @@ Usage:
   helm bridge up [--lan]
   helm bridge pair [--no-start]
   helm bridge status
+  helm bridge service <install|uninstall|start|stop|restart|status|print-plist>
+  helm bridge update [update options]
   helm bridge down
 
 Bridge commands:
-  setup   Run the guided Helm bridge setup flow.
-  up      Start the local bridge and Codex app-server helper.
-  pair    Start the bridge if needed, then print the pairing QR and setup link.
-  status  Show bridge health, pairing details, and voice-provider availability.
-  down    Stop the local prototype bridge stack.
+  setup    Run the guided Helm bridge setup flow.
+  up       Start the local bridge and Codex app-server helper.
+  pair     Start the bridge if needed, then print the pairing QR and setup link.
+  status   Show bridge health, pairing details, and voice-provider availability.
+  service  Manage the launchd bridge service.
+  update   Update Helm and restart the bridge service.
+  down     Stop the local prototype bridge stack.
 `);
 }
 
@@ -105,6 +113,10 @@ function runPlatforms(args) {
   runScript("detect-helm-platforms.sh", args);
 }
 
+function runUpdate(args) {
+  runScript("helm-update.sh", args);
+}
+
 function runBridge(args) {
   const [subcommand, ...bridgeArgs] = args;
 
@@ -128,6 +140,13 @@ function runBridge(args) {
       return;
     case "status":
       runScript("prototype-status.sh", bridgeArgs);
+      return;
+    case "service":
+      runScript("bridge-service.sh", bridgeArgs);
+      return;
+    case "update":
+    case "upgrade":
+      runUpdate(bridgeArgs);
       return;
     case "down":
     case "stop":
@@ -166,6 +185,10 @@ switch (command) {
   case "platforms":
   case "doctor":
     runPlatforms(rawArgs);
+    break;
+  case "update":
+  case "upgrade":
+    runUpdate(rawArgs);
     break;
   case "up":
   case "start":

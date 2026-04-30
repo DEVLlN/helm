@@ -79,12 +79,17 @@ const SHELL_RELAY_QUEUE_ACCEPT_TIMEOUT_MS = 3_000;
 const SHELL_RELAY_QUEUE_RETRY_DELAY_MS = 650;
 const SHELL_RELAY_QUEUE_ACCEPT_POLL_INTERVAL_MS = 150;
 const INTERRUPT_BEFORE_SEND_TIMEOUT_MS = 6_000;
-const APP_SERVER_MAX_INBOUND_MESSAGE_BYTES = 8 * 1024 * 1024;
+const APP_SERVER_MAX_INBOUND_MESSAGE_BYTES = 128 * 1024 * 1024;
 const LOCAL_ROLLOUT_FULLER_TURN_DELTA = 1;
 const LOCAL_ROLLOUT_FULLER_ITEM_DELTA = 8;
 const CODEX_DESKTOP_CONTROLLER_ID = "codex-desktop";
 const CODEX_DESKTOP_CONTROLLER_NAME = "Codex Desktop";
 const CODEX_DESKTOP_DUPLICATE_QUEUE_WINDOW_MS = 2_500;
+const CODEX_DESKTOP_REFRESH_BUNDLE_ID = "com.openai.codex";
+const CODEX_DESKTOP_REFRESH_APP_PATH = "/Applications/Codex.app";
+const CODEX_DESKTOP_REFRESH_BOUNCE_URL = "codex://settings";
+const CODEX_DESKTOP_REFRESH_AFTER_BOUNCE_MS = 180;
+const CODEX_DESKTOP_REFRESH_AFTER_TARGET_MS = 180;
 
 type CodexAppServerSocket = WebSocket;
 
@@ -138,6 +143,10 @@ function websocketMessageBuffer(data: RawData | string): Buffer {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function stringValue(value: unknown): string | null {
@@ -328,6 +337,42 @@ function stringArrayValue(value: unknown): string[] {
     .filter((entry): entry is string => typeof entry === "string")
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
+}
+
+function threadIdFromPayload(value: unknown): string | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const candidates = [
+    value.threadId,
+    value.thread_id,
+    value.conversationId,
+    value.conversation_id,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  const thread = value.thread;
+  if (isRecord(thread)) {
+    const threadId = threadIdFromPayload(thread);
+    if (threadId) {
+      return threadId;
+    }
+  }
+
+  const turn = value.turn;
+  if (isRecord(turn)) {
+    const turnThreadId = threadIdFromPayload(turn);
+    if (turnThreadId) {
+      return turnThreadId;
+    }
+  }
+
+  return null;
 }
 
 function normalizeWorkspaceRoot(value: string): string {
@@ -610,6 +655,7 @@ export class CodexAppServerClient extends EventEmitter {
   private readonly pending = new Map<JSONRPCId, PendingRequest>();
   private readonly managedShellEnsures = new Map<string, Promise<EnsureManagedShellThreadResult>>();
   private codexDesktopQueueMutation: Promise<unknown> = Promise.resolve();
+  private readonly codexDesktopAppServerRefreshThreads = new Set<string>();
 
   constructor(private readonly endpoint: string) {
     super();
@@ -752,6 +798,7 @@ export class CodexAppServerClient extends EventEmitter {
         method: message.method,
         params: message.params,
       };
+      this.handleCodexDesktopAppServerRefreshEvent(event);
       this.emit("event", event);
       return;
     }
@@ -1483,16 +1530,42 @@ export class CodexAppServerClient extends EventEmitter {
               appServerSteerError = steerError instanceof Error ? steerError : new Error(String(steerError));
             }
           }
-          if (this.shouldFallbackDesktopIpcNoClientToAppServer(desktopIpcError, desktopIpcDeliveryBaseline)) {
+          if (
+            this.shouldFallbackDesktopIpcNoClientToAppServer(
+              desktopIpcError,
+              desktopIpcDeliveryBaseline,
+              desktopIpcDeliveryThread.sourceKind
+            )
+          ) {
+            const needsDesktopRouteRefresh = codexSourceKindRequiresDesktopIpc(desktopIpcDeliveryThread.sourceKind);
             console.warn(
-              `[bridge] Codex Desktop IPC had no client for idle thread ${threadId}; starting via app-server instead.`
+              needsDesktopRouteRefresh
+                ? `[bridge] Codex Desktop IPC had no client for idle desktop thread ${threadId}; loading it through app-server and refreshing Codex.app.`
+                : `[bridge] Codex Desktop IPC had no client for idle thread ${threadId}; loading the thread and starting via app-server instead.`
             );
-            return await this.startTurnViaAppServer(
-              threadId,
-              effectiveText,
-              options,
-              "appServerStartAfterDesktopIpcNoClient"
-            );
+            if (needsDesktopRouteRefresh) {
+              this.codexDesktopAppServerRefreshThreads.add(threadId);
+            }
+            let result: JSONValue | undefined;
+            try {
+              result = await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
+                threadId,
+                activeDeliveryText,
+                options,
+                needsDesktopRouteRefresh
+                  ? "appServerStartAfterDesktopIpcNoClientWithDesktopRefresh"
+                  : "appServerStartAfterDesktopIpcNoClient"
+              );
+            } catch (error) {
+              if (needsDesktopRouteRefresh) {
+                this.codexDesktopAppServerRefreshThreads.delete(threadId);
+              }
+              throw error;
+            }
+            if (needsDesktopRouteRefresh) {
+              void this.refreshCodexDesktopThreadRoute(threadId, "desktop-ipc-no-client");
+            }
+            return result;
           }
           throw new Error(this.codexDesktopIpcDeliveryFailureMessage(threadId, desktopIpcError));
         }
@@ -1582,6 +1655,18 @@ export class CodexAppServerClient extends EventEmitter {
           // instead of falling through to prompt-level shell injection.
           return await this.startTurnViaCLIResume(threadId, effectiveText, options);
         }
+        if (
+          activeDeliveryRequested
+          && !hasImageAttachments
+          && this.shouldRetryAppServerStartAfterThreadLoadError(appServerStartError)
+        ) {
+          return await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
+            threadId,
+            activeDeliveryText,
+            options,
+            "appServerStartAfterThreadLoadRetry"
+          );
+        }
       }
     }
 
@@ -1604,6 +1689,18 @@ export class CodexAppServerClient extends EventEmitter {
       }
       if (await this.shouldResumeTurnViaCLI(threadId, error)) {
         return await this.startTurnViaCLIResume(threadId, effectiveText, options);
+      }
+      if (
+        activeDeliveryRequested
+        && !hasImageAttachments
+        && this.shouldRetryAppServerStartAfterThreadLoadError(error)
+      ) {
+        return await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
+          threadId,
+          activeDeliveryText,
+          options,
+          "appServerStartAfterThreadLoadRetry"
+        );
       }
       if (appServerStartError && shellRelayError) {
         throw new Error(`${appServerStartError.message}; shell relay also failed: ${shellRelayError.message}; app-server turn delivery also failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1659,11 +1756,85 @@ export class CodexAppServerClient extends EventEmitter {
     };
   }
 
+  private async startTurnViaAppServerAfterEnsuringThreadLoaded(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions = {},
+    mode = "appServerStartAfterThreadLoad"
+  ): Promise<JSONValue | undefined> {
+    await this.ensureAppServerThreadLoadedForDelivery(threadId, { forceResume: true });
+    return await this.startTurnViaAppServer(threadId, text, options, mode);
+  }
+
+  private async ensureAppServerThreadLoadedForDelivery(
+    threadId: string,
+    options: { forceResume?: boolean } = {}
+  ): Promise<void> {
+    if (!options.forceResume) {
+      try {
+        const loaded = await this.listLoadedThreads();
+        if (loaded.has(threadId)) {
+          return;
+        }
+      } catch (error) {
+        console.warn(
+          `[bridge] Codex thread/loaded/list failed before delivery retry for ${threadId}: ${errorMessage(error)}`
+        );
+      }
+    }
+
+    const thread = await discoverCodexThread(threadId);
+    if (!thread) {
+      return;
+    }
+
+    const rolloutPath = await resolveCodexThreadRolloutPath(threadId);
+    if (!rolloutPath) {
+      return;
+    }
+
+    try {
+      await this.request("thread/resume", {
+        threadId,
+        path: rolloutPath,
+        cwd: thread.cwd || null,
+        persistExtendedHistory: true,
+        includeTurns: false,
+      });
+    } catch (error) {
+      const message = errorMessage(error).toLowerCase();
+      if (
+        message.includes("cannot resume running thread")
+        || message.includes("retry thread/resume after the thread is closed")
+        || message.includes("already loaded")
+      ) {
+        return;
+      }
+      throw error;
+    }
+  }
+
   private shouldFallbackDesktopIpcNoClientToAppServer(
     error: Error,
-    baseline: ThreadDeliverySnapshot | null
+    baseline: ThreadDeliverySnapshot | null,
+    sourceKind: string | null | undefined
   ): boolean {
-    return this.isCodexDesktopIpcNoClientError(error) && baseline?.threadStatus !== "running";
+    if (!this.isCodexDesktopIpcNoClientError(error) || baseline?.threadStatus === "running") {
+      return false;
+    }
+
+    if (!codexSourceKindRequiresDesktopIpc(sourceKind)) {
+      return true;
+    }
+
+    return this.canRefreshCodexDesktopThreadRoute();
+  }
+
+  private shouldRetryAppServerStartAfterThreadLoadError(error: unknown): boolean {
+    const message = errorMessage(error).toLowerCase();
+    return message.includes("thread not loaded")
+      || message.includes("thread not found")
+      || message.includes("is not materialized yet");
   }
 
   private isCodexDesktopIpcNoClientError(error: Error): boolean {
@@ -1671,6 +1842,62 @@ export class CodexAppServerClient extends EventEmitter {
       return true;
     }
     return error.message.toLowerCase().includes("no-client-found");
+  }
+
+  private canRefreshCodexDesktopThreadRoute(): boolean {
+    if (process.platform !== "darwin") {
+      return false;
+    }
+
+    const value = process.env.HELM_CODEX_DESKTOP_REFRESH?.trim().toLowerCase();
+    return value !== "0" && value !== "false" && value !== "no" && value !== "off";
+  }
+
+  private handleCodexDesktopAppServerRefreshEvent(event: ConversationEvent): void {
+    const method = event.method.trim().toLowerCase();
+    if (method !== "turn/completed" && method !== "turn/failed" && method !== "turn/error") {
+      return;
+    }
+
+    const threadId = threadIdFromPayload(event.params);
+    if (!threadId || !this.codexDesktopAppServerRefreshThreads.has(threadId)) {
+      return;
+    }
+
+    void this.refreshCodexDesktopThreadRoute(threadId, method).finally(() => {
+      this.codexDesktopAppServerRefreshThreads.delete(threadId);
+    });
+  }
+
+  private async refreshCodexDesktopThreadRoute(threadId: string, reason = "refresh"): Promise<boolean> {
+    if (!this.canRefreshCodexDesktopThreadRoute()) {
+      return false;
+    }
+
+    const targetUrl = `codex://threads/${encodeURIComponent(threadId)}`;
+    try {
+      await this.openCodexDesktopUrl(CODEX_DESKTOP_REFRESH_BOUNCE_URL);
+      await sleep(CODEX_DESKTOP_REFRESH_AFTER_BOUNCE_MS);
+      await this.openCodexDesktopUrl(targetUrl);
+      await sleep(CODEX_DESKTOP_REFRESH_AFTER_TARGET_MS);
+      console.log(`[bridge] Refreshed Codex.app thread route ${threadId} after ${reason}`);
+      return true;
+    } catch (error) {
+      console.warn(
+        `[bridge] Failed to refresh Codex.app thread route ${threadId}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
+    }
+  }
+
+  private async openCodexDesktopUrl(url: string): Promise<void> {
+    const bundleId = process.env.HELM_CODEX_BUNDLE_ID?.trim() || CODEX_DESKTOP_REFRESH_BUNDLE_ID;
+    const appPath = process.env.HELM_CODEX_APP_PATH?.trim() || CODEX_DESKTOP_REFRESH_APP_PATH;
+    try {
+      await execFileAsync("/usr/bin/open", ["-b", bundleId, url], { timeout: 5_000 });
+    } catch {
+      await execFileAsync("/usr/bin/open", ["-a", appPath, url], { timeout: 5_000 });
+    }
   }
 
   private async startTurnViaCodexDesktopIpc(
@@ -2320,7 +2547,14 @@ export class CodexAppServerClient extends EventEmitter {
       return discovered;
     }
 
-    return await this.loadThreadSummary(threadId);
+    try {
+      return await this.loadThreadSummary(threadId);
+    } catch (error) {
+      console.warn(
+        `[bridge] Codex thread summary unavailable while resolving delivery for ${threadId}: ${errorMessage(error)}`
+      );
+      return null;
+    }
   }
 
   private async launchManagedShellResume(
@@ -2473,6 +2707,7 @@ export class CodexAppServerClient extends EventEmitter {
       path: rolloutPath ?? null,
       cwd: thread.cwd || null,
       persistExtendedHistory: true,
+      includeTurns: false,
     });
     return true;
   }
@@ -2796,7 +3031,7 @@ export class CodexAppServerClient extends EventEmitter {
   private codexDesktopIpcDeliveryFailureMessage(threadId: string, error: Error): string {
     return [
       `Codex.app delivery failed for ${threadId}: ${error.message}`,
-      "Helm did not fall back to the standalone app-server because that would write to a hidden side thread instead of the visible Codex.app conversation.",
+      "Helm did not fall back to the standalone app-server because Codex.app route refresh is unavailable or the thread is still running.",
       "Keep the thread open in Codex.app and try again.",
     ].join(" ");
   }

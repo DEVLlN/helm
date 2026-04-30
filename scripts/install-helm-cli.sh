@@ -37,6 +37,7 @@ link_script "$ROOT_DIR/scripts/prototype-up.sh" "helm-prototype-up"
 link_script "$ROOT_DIR/scripts/prototype-status.sh" "helm-prototype-status"
 link_script "$ROOT_DIR/scripts/prototype-down.sh" "helm-prototype-down"
 link_script "$ROOT_DIR/scripts/bridge-service.sh" "helm-bridge-service"
+link_script "$ROOT_DIR/scripts/helm-update.sh" "helm-update"
 link_script "$ROOT_DIR/scripts/print-pairing-qr.sh" "helm-pairing-qr"
 link_script "$ROOT_DIR/scripts/detect-helm-platforms.sh" "helm-platforms"
 link_script "$ROOT_DIR/scripts/install-local-prototypes.sh" "helm-install-local-prototypes"
@@ -71,6 +72,7 @@ Available helpers:
   helm-prototype-status
   helm-prototype-down
   helm-bridge-service
+  helm-update
   helm-pairing-qr
   helm-platforms
   helm-install-local-prototypes
@@ -99,9 +101,11 @@ Recommended next steps:
      helm-prototype-up
   5. Print a pairing QR in the terminal if you need it again:
      helm-pairing-qr
-  6. In helm on iPhone, scan the pairing QR.
-  7. Start Codex CLI, Claude Code, or Grok CLI sessions normally.
-  8. If Ollama is installed, start local model sessions with:
+  6. Update the installed bridge manually if needed:
+     helm update
+  7. In helm on iPhone, scan the pairing QR.
+  8. Start Codex CLI, Claude Code, or Grok CLI sessions normally.
+  9. If Ollama is installed, start local model sessions with:
      helm-gemma
      helm-qwen
 
