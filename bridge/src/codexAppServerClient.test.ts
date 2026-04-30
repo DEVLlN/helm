@@ -125,6 +125,19 @@ type CodexClientPrivateHooks = {
     thread: { cwd?: string; sourceKind?: string | null },
     baseline: unknown
   ): Promise<JSONValue | undefined>;
+  startTurnViaAppServerSteer(
+    threadId: string,
+    text: string,
+    baseline: {
+      hasTurnData: boolean;
+      turnCount: number;
+      matchingUserTextCount: number;
+      updatedAt: number;
+      threadStatus: string | null;
+      activeTurnId: string | null;
+    },
+    options?: { swallowErrors?: boolean }
+  ): Promise<JSONValue | undefined>;
   codexDesktopQueuedFollowUpsWithAppendedMessage(
     currentMessages: TestQueuedFollowUp[],
     message: TestQueuedFollowUp
@@ -399,6 +412,64 @@ test("idle Codex desktop turn falls back to app-server when desktop IPC has no l
   assert.deepEqual(result, {
     ok: true,
     mode: "appServerStartAfterDesktopIpcNoClient",
+    threadId: "thread-1",
+  });
+});
+
+test("running Codex desktop steer falls back to app-server steer when desktop IPC has no loaded client", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const appServerSteerCalls: Array<{
+    threadId: string;
+    text: string;
+    activeTurnId: string | null;
+  }> = [];
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "vscode",
+    status: "running",
+  });
+  hooks.readThreadDeliverySnapshot = async () => ({
+    hasTurnData: true,
+    turnCount: 2,
+    matchingUserTextCount: 0,
+    updatedAt: 123_000,
+    threadStatus: "idle",
+    activeTurnId: "turn-1",
+  });
+  hooks.steerTurnViaCodexDesktopIpc = async () => {
+    throw new Error("Codex Desktop IPC thread-follower-steer-turn failed: no-client-found");
+  };
+  hooks.startTurnViaCodexDesktopIpc = async () => {
+    throw new Error("running steer must not start a side turn");
+  };
+  hooks.startTurnViaAppServerSteer = async (threadId, text, baseline) => {
+    appServerSteerCalls.push({
+      threadId,
+      text,
+      activeTurnId: baseline.activeTurnId,
+    });
+    return {
+      ok: true,
+      mode: "appServerSteerQueued",
+      threadId,
+    };
+  };
+
+  const result = await client.startTurn("thread-1", "testing mobile", {
+    deliveryMode: "steer",
+  });
+
+  assert.deepEqual(appServerSteerCalls, [
+    {
+      threadId: "thread-1",
+      text: "testing mobile",
+      activeTurnId: "turn-1",
+    },
+  ]);
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "appServerSteerQueued",
     threadId: "thread-1",
   });
 });

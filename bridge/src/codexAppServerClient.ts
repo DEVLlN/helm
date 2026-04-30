@@ -1409,7 +1409,9 @@ export class CodexAppServerClient extends EventEmitter {
     const activeDeliveryTerminalLooksQueueable =
       activeDeliveryHasRuntimeRelay && runtimeTailLooksQueueable(readRuntimeOutputTail(activeDeliveryLaunch));
     const activeDeliveryNeedsRunningTurnSteer =
-      activeDeliverySnapshot?.threadStatus === "running" || activeDeliveryTerminalLooksQueueable;
+      activeDeliverySnapshot?.threadStatus === "running"
+      || Boolean(activeDeliverySnapshot?.activeTurnId)
+      || activeDeliveryTerminalLooksQueueable;
 
     const desktopIpcDeliveryThread = deliveryThread;
     const desktopIpcDeliveryBaseline = desktopIpcDeliveryThread
@@ -1460,6 +1462,27 @@ export class CodexAppServerClient extends EventEmitter {
       } catch (error) {
         const desktopIpcError = error instanceof Error ? error : new Error(String(error));
         if (codexSourceKindRequiresDesktopIpc(desktopIpcDeliveryThread.sourceKind)) {
+          const runningTurnSnapshot = activeDeliverySnapshot;
+          if (
+            steerDeliveryRequested
+            && this.isCodexDesktopIpcNoClientError(desktopIpcError)
+            && runningTurnSnapshot !== null
+            && Boolean(runningTurnSnapshot.activeTurnId)
+          ) {
+            try {
+              const steered = await this.startTurnViaAppServerSteer(
+                threadId,
+                activeDeliveryText,
+                runningTurnSnapshot,
+                { swallowErrors: false }
+              );
+              if (steered) {
+                return steered;
+              }
+            } catch (steerError) {
+              appServerSteerError = steerError instanceof Error ? steerError : new Error(String(steerError));
+            }
+          }
           if (this.shouldFallbackDesktopIpcNoClientToAppServer(desktopIpcError, desktopIpcDeliveryBaseline)) {
             console.warn(
               `[bridge] Codex Desktop IPC had no client for idle thread ${threadId}; starting via app-server instead.`
@@ -2844,7 +2867,7 @@ export class CodexAppServerClient extends EventEmitter {
     baseline: ThreadDeliverySnapshot,
     options: { swallowErrors?: boolean } = {}
   ): Promise<JSONValue | undefined> {
-    if (baseline.threadStatus !== "running" || !baseline.activeTurnId) {
+    if (!baseline.activeTurnId) {
       return undefined;
     }
 
