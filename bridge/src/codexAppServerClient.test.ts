@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import net from "node:net";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { WebSocketServer } from "ws";
 
 import { CodexAppServerClient, currentPromptDraftFromTerminalTail } from "./codexAppServerClient.js";
 import { codexProjectNameForPath } from "./codexProjectNames.js";
@@ -117,100 +118,40 @@ type CodexClientPrivateHooks = {
     options: TestStartTurnOptions,
     baseline: unknown
   ): Promise<JSONValue | undefined>;
+  steerTurnViaCodexDesktopIpc(
+    threadId: string,
+    text: string,
+    options: TestStartTurnOptions,
+    thread: { cwd?: string; sourceKind?: string | null },
+    baseline: unknown
+  ): Promise<JSONValue | undefined>;
   codexDesktopQueuedFollowUpsWithAppendedMessage(
     currentMessages: TestQueuedFollowUp[],
     message: TestQueuedFollowUp
   ): TestQueuedFollowUp[];
 };
 
-function encodeRawServerTextFrame(text: string): Buffer {
-  const payload = Buffer.from(text, "utf8");
-  if (payload.length < 126) {
-    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-  }
-
-  if (payload.length < 65_536) {
-    const header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(payload.length, 2);
-    return Buffer.concat([header, payload]);
-  }
-
-  const header = Buffer.alloc(10);
-  header[0] = 0x81;
-  header[1] = 127;
-  header.writeBigUInt64BE(BigInt(payload.length), 2);
-  return Buffer.concat([header, payload]);
-}
-
-function decodeRawClientTextFrame(buffer: Buffer): { text: string; consumed: number } | null {
-  if (buffer.length < 2) {
-    return null;
-  }
-
-  const firstByte = buffer[0]!;
-  const secondByte = buffer[1]!;
-  const opcode = firstByte & 0x0f;
-  let length = secondByte & 0x7f;
-  let offset = 2;
-  if (length === 126) {
-    if (buffer.length < offset + 2) {
-      return null;
-    }
-    length = buffer.readUInt16BE(offset);
-    offset += 2;
-  } else if (length === 127) {
-    if (buffer.length < offset + 8) {
-      return null;
-    }
-    length = Number(buffer.readBigUInt64BE(offset));
-    offset += 8;
-  }
-
-  const masked = (secondByte & 0x80) !== 0;
-  if (!masked || opcode !== 1) {
-    throw new Error("expected masked text frame");
-  }
-
-  if (buffer.length < offset + 4 + length) {
-    return null;
-  }
-
-  const mask = buffer.subarray(offset, offset + 4);
-  offset += 4;
-  const payload = Buffer.from(buffer.subarray(offset, offset + length));
-  for (let index = 0; index < payload.length; index += 1) {
-    payload[index] = payload[index]! ^ mask[index % 4]!;
-  }
-
-  return { text: payload.toString("utf8"), consumed: offset + length };
-}
-
-test("Codex app-server client initializes over raw unix socket transport", async (t) => {
+test("Codex app-server client initializes over websocket unix socket transport", async (t) => {
   if (process.platform === "win32") {
     return;
   }
 
   const directory = mkdtempSync(path.join(tmpdir(), "codex-app-server-unix-"));
   const socketPath = path.join(directory, "app.sock");
-  const server = net.createServer((socket) => {
-    let buffer = Buffer.alloc(0);
+  const server = http.createServer();
+  const sockets = new WebSocketServer({
+    server,
+    perMessageDeflate: false,
+  });
 
-    socket.on("data", (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      const frame = decodeRawClientTextFrame(buffer);
-      if (!frame) {
-        return;
-      }
-
-      buffer = buffer.subarray(frame.consumed);
-      const request = JSON.parse(frame.text) as {
+  sockets.on("connection", (socket) => {
+    socket.once("message", (data) => {
+      const request = JSON.parse(data.toString()) as {
         id: string | number;
         method?: string;
       };
       assert.equal(request.method, "initialize");
-      socket.write(encodeRawServerTextFrame(JSON.stringify({
+      socket.send(JSON.stringify({
         id: request.id,
         result: {
           userAgent: "fake-codex",
@@ -218,13 +159,15 @@ test("Codex app-server client initializes over raw unix socket transport", async
           platformFamily: "unix",
           platformOs: "macos",
         },
-      })), () => {
-        socket.destroy();
-      });
+      }), () => socket.close());
     });
   });
 
   t.after(() => {
+    for (const client of sockets.clients) {
+      client.terminate();
+    }
+    sockets.close();
     server.close();
     rmSync(directory, { recursive: true, force: true });
   });
@@ -349,6 +292,113 @@ test("idle attached CLI turn delivery skips managed shell launch before app-serv
   assert.deepEqual(result, {
     ok: true,
     mode: "steer",
+    threadId: "thread-1",
+  });
+});
+
+test("queued idle Codex desktop turn starts immediately instead of becoming an invisible follow-up", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  let enqueueCalls = 0;
+  let startCalls = 0;
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "vscode",
+    status: "idle",
+  });
+  hooks.readThreadDeliverySnapshot = async () => ({
+    hasTurnData: true,
+    turnCount: 2,
+    matchingUserTextCount: 0,
+    updatedAt: 123_000,
+    threadStatus: "idle",
+    activeTurnId: null,
+  });
+  hooks.enqueueTurnViaCodexDesktopIpc = async () => {
+    enqueueCalls += 1;
+    throw new Error("idle desktop sends should not queue a follow-up");
+  };
+  hooks.startTurnViaCodexDesktopIpc = async (threadId, text, options) => {
+    startCalls += 1;
+    assert.equal(threadId, "thread-1");
+    assert.equal(text, "from mobile");
+    assert.equal(options.deliveryMode, "queue");
+    return {
+      ok: true,
+      mode: "codexDesktopIpcStart",
+      threadId,
+    };
+  };
+
+  const result = await client.startTurn("thread-1", "from mobile", {
+    deliveryMode: "queue",
+  });
+
+  assert.equal(enqueueCalls, 0);
+  assert.equal(startCalls, 1);
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "codexDesktopIpcStart",
+    threadId: "thread-1",
+  });
+});
+
+test("idle Codex desktop turn falls back to app-server when desktop IPC has no loaded client", async () => {
+  const client = new CodexAppServerClient("ws://127.0.0.1:0");
+  const hooks = client as unknown as CodexClientPrivateHooks;
+  const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+
+  hooks.loadThreadDeliverySummary = async () => ({
+    sourceKind: "vscode",
+    status: "idle",
+  });
+  hooks.readThreadDeliverySnapshot = async () => ({
+    hasTurnData: true,
+    turnCount: 2,
+    matchingUserTextCount: 0,
+    updatedAt: 123_000,
+    threadStatus: "idle",
+    activeTurnId: null,
+  });
+  hooks.startTurnViaCodexDesktopIpc = async () => {
+    throw new Error("Codex Desktop IPC thread-follower-start-turn failed: no-client-found");
+  };
+  hooks.steerTurnViaCodexDesktopIpc = async () => {
+    throw new Error("Codex Desktop IPC thread-follower-steer-turn failed: no-client-found");
+  };
+  hooks.enqueueTurnViaCodexDesktopIpc = async () => {
+    throw new Error("idle desktop sends should not queue a follow-up");
+  };
+  hooks.request = async (method: string, params?: JSONValue) => {
+    requestCalls.push({ method, params });
+    assert.equal(method, "turn/start");
+    return {
+      ok: true,
+    };
+  };
+
+  const result = await client.startTurn("thread-1", "from mobile", {
+    deliveryMode: "steer",
+  });
+
+  assert.deepEqual(requestCalls, [
+    {
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        input: [
+          {
+            type: "text",
+            text: "from mobile",
+            text_elements: [],
+          },
+        ],
+      },
+    },
+  ]);
+  assert.deepEqual(result, {
+    ok: true,
+    mode: "appServerStartAfterDesktopIpcNoClient",
     threadId: "thread-1",
   });
 });

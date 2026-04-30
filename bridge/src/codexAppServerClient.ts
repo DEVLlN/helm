@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import EventEmitter from "node:events";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -86,14 +86,7 @@ const CODEX_DESKTOP_CONTROLLER_ID = "codex-desktop";
 const CODEX_DESKTOP_CONTROLLER_NAME = "Codex Desktop";
 const CODEX_DESKTOP_DUPLICATE_QUEUE_WINDOW_MS = 2_500;
 
-type CodexAppServerSocket = WebSocket | CodexUnixSocketWebSocket;
-
-type RawWebSocketFrame = {
-  opcode: number;
-  final: boolean;
-  payload: Buffer;
-  consumed: number;
-};
+type CodexAppServerSocket = WebSocket;
 
 type EnsureManagedShellThreadResult = {
   threadId: string;
@@ -114,241 +107,6 @@ function unixSocketPathFromAppServerEndpoint(endpoint: string): string | null {
   }
 
   return socketPath;
-}
-
-function encodeRawWebSocketFrame(opcode: number, payload: Buffer, mask: boolean): Buffer {
-  let header: Buffer;
-  if (payload.length < 126) {
-    header = Buffer.from([0x80 | opcode, (mask ? 0x80 : 0) | payload.length]);
-  } else if (payload.length < 65_536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode;
-    header[1] = (mask ? 0x80 : 0) | 126;
-    header.writeUInt16BE(payload.length, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
-    header[1] = (mask ? 0x80 : 0) | 127;
-    header.writeBigUInt64BE(BigInt(payload.length), 2);
-  }
-
-  if (!mask) {
-    return Buffer.concat([header, payload]);
-  }
-
-  const maskKey = randomBytes(4);
-  const maskedPayload = Buffer.alloc(payload.length);
-  for (let index = 0; index < payload.length; index += 1) {
-    maskedPayload[index] = payload[index]! ^ maskKey[index % 4]!;
-  }
-
-  return Buffer.concat([header, maskKey, maskedPayload]);
-}
-
-function decodeRawWebSocketFrame(buffer: Buffer): RawWebSocketFrame | null {
-  if (buffer.length < 2) {
-    return null;
-  }
-
-  const firstByte = buffer[0]!;
-  const secondByte = buffer[1]!;
-  let payloadLength = secondByte & 0x7f;
-  let offset = 2;
-
-  if (payloadLength === 126) {
-    if (buffer.length < offset + 2) {
-      return null;
-    }
-    payloadLength = buffer.readUInt16BE(offset);
-    offset += 2;
-  } else if (payloadLength === 127) {
-    if (buffer.length < offset + 8) {
-      return null;
-    }
-
-    const length = buffer.readBigUInt64BE(offset);
-    if (length > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new Error("Codex app-server unix socket frame is too large");
-    }
-
-    payloadLength = Number(length);
-    offset += 8;
-  }
-
-  const masked = (secondByte & 0x80) !== 0;
-  const maskOffset = offset;
-  if (masked) {
-    offset += 4;
-  }
-
-  if (buffer.length < offset + payloadLength) {
-    return null;
-  }
-
-  const payload = Buffer.from(buffer.subarray(offset, offset + payloadLength));
-  if (masked) {
-    const maskKey = buffer.subarray(maskOffset, maskOffset + 4);
-    for (let index = 0; index < payload.length; index += 1) {
-      payload[index] = payload[index]! ^ maskKey[index % 4]!;
-    }
-  }
-
-  return {
-    opcode: firstByte & 0x0f,
-    final: (firstByte & 0x80) !== 0,
-    payload,
-    consumed: offset + payloadLength,
-  };
-}
-
-class CodexUnixSocketWebSocket extends EventEmitter {
-  readyState: number = WebSocket.CONNECTING;
-  private readonly socket: net.Socket;
-  private readBuffer = Buffer.alloc(0);
-  private fragmentedOpcode: number | null = null;
-  private fragmentedPayloads: Buffer[] = [];
-
-  constructor(
-    private readonly socketPath: string,
-    private readonly maxPayload: number
-  ) {
-    super();
-    this.socket = net.createConnection(socketPath);
-    this.socket.once("connect", () => {
-      this.readyState = WebSocket.OPEN;
-      this.emit("open");
-    });
-    this.socket.on("data", (chunk) => this.handleData(chunk));
-    this.socket.on("error", (error) => {
-      this.emit("error", error);
-    });
-    this.socket.on("close", () => {
-      this.readyState = WebSocket.CLOSED;
-      this.emit("close");
-    });
-  }
-
-  send(data: string): void {
-    if (this.readyState !== WebSocket.OPEN) {
-      throw new Error(`Codex app-server unix socket is not open: ${this.socketPath}`);
-    }
-
-    this.socket.write(encodeRawWebSocketFrame(0x1, Buffer.from(data, "utf8"), true));
-  }
-
-  close(code = 1000, reason = ""): void {
-    if (this.readyState === WebSocket.CLOSED || this.readyState === WebSocket.CLOSING) {
-      return;
-    }
-
-    this.readyState = WebSocket.CLOSING;
-    const reasonBuffer = Buffer.from(reason, "utf8");
-    const payload = Buffer.alloc(2 + reasonBuffer.length);
-    payload.writeUInt16BE(code, 0);
-    reasonBuffer.copy(payload, 2);
-
-    if (this.socket.writable) {
-      this.socket.write(encodeRawWebSocketFrame(0x8, payload, true), () => {
-        this.socket.end();
-      });
-    } else {
-      this.socket.destroy();
-    }
-  }
-
-  private handleData(chunk: Buffer): void {
-    this.readBuffer = Buffer.concat([this.readBuffer, chunk]);
-
-    try {
-      while (true) {
-        const frame = decodeRawWebSocketFrame(this.readBuffer);
-        if (!frame) {
-          return;
-        }
-
-        this.readBuffer = this.readBuffer.subarray(frame.consumed);
-        this.handleFrame(frame);
-      }
-    } catch (error) {
-      this.emit("error", error instanceof Error ? error : new Error(String(error)));
-      this.close(1002, "Invalid Codex app-server unix socket frame");
-    }
-  }
-
-  private handleFrame(frame: RawWebSocketFrame): void {
-    if (frame.payload.length > this.maxPayload) {
-      this.emit(
-        "error",
-        new Error(`Codex app-server message too large: ${frame.payload.length} bytes`)
-      );
-      this.close(1009, "Codex app-server message too large");
-      return;
-    }
-
-    switch (frame.opcode) {
-      case 0x0:
-        this.handleContinuationFrame(frame);
-        break;
-      case 0x1:
-      case 0x2:
-        this.handleDataFrame(frame);
-        break;
-      case 0x8:
-        if (this.readyState !== WebSocket.CLOSING) {
-          this.close();
-        } else {
-          this.socket.end();
-        }
-        break;
-      case 0x9:
-        if (this.socket.writable) {
-          this.socket.write(encodeRawWebSocketFrame(0xA, frame.payload, true));
-        }
-        break;
-      case 0xA:
-        break;
-      default:
-        this.close(1002, "Unsupported Codex app-server unix socket frame");
-        break;
-    }
-  }
-
-  private handleDataFrame(frame: RawWebSocketFrame): void {
-    if (!frame.final) {
-      this.fragmentedOpcode = frame.opcode;
-      this.fragmentedPayloads = [frame.payload];
-      return;
-    }
-
-    this.emitMessage(frame.opcode, frame.payload);
-  }
-
-  private handleContinuationFrame(frame: RawWebSocketFrame): void {
-    if (!this.fragmentedOpcode) {
-      this.close(1002, "Unexpected Codex app-server continuation frame");
-      return;
-    }
-
-    this.fragmentedPayloads.push(frame.payload);
-    if (!frame.final) {
-      return;
-    }
-
-    const opcode = this.fragmentedOpcode;
-    const payload = Buffer.concat(this.fragmentedPayloads);
-    this.fragmentedOpcode = null;
-    this.fragmentedPayloads = [];
-    this.emitMessage(opcode, payload);
-  }
-
-  private emitMessage(opcode: number, payload: Buffer): void {
-    if (opcode === 0x1) {
-      this.emit("message", payload.toString("utf8"));
-      return;
-    }
-
-    this.emit("message", payload);
-  }
 }
 
 type ThreadDeliverySnapshot = {
@@ -941,14 +699,16 @@ export class CodexAppServerClient extends EventEmitter {
   private createSocket(): CodexAppServerSocket {
     const unixSocketPath = unixSocketPathFromAppServerEndpoint(this.endpoint);
     if (unixSocketPath) {
-      return new CodexUnixSocketWebSocket(
-        unixSocketPath,
-        APP_SERVER_MAX_INBOUND_MESSAGE_BYTES
-      );
+      return new WebSocket("ws://localhost/", {
+        createConnection: () => net.createConnection(unixSocketPath),
+        maxPayload: APP_SERVER_MAX_INBOUND_MESSAGE_BYTES,
+        perMessageDeflate: false,
+      });
     }
 
     return new WebSocket(this.endpoint, {
       maxPayload: APP_SERVER_MAX_INBOUND_MESSAGE_BYTES,
+      perMessageDeflate: false,
     });
   }
 
@@ -1664,6 +1424,14 @@ export class CodexAppServerClient extends EventEmitter {
     ) {
       try {
         if (queueDeliveryRequested) {
+          if (!hasImageAttachments && desktopIpcDeliveryBaseline?.threadStatus !== "running") {
+            return await this.startTurnViaCodexDesktopIpc(
+              threadId,
+              activeDeliveryText,
+              options,
+              desktopIpcDeliveryBaseline
+            );
+          }
           return await this.enqueueTurnViaCodexDesktopIpc(
             threadId,
             queueSafeText,
@@ -1692,6 +1460,17 @@ export class CodexAppServerClient extends EventEmitter {
       } catch (error) {
         const desktopIpcError = error instanceof Error ? error : new Error(String(error));
         if (codexSourceKindRequiresDesktopIpc(desktopIpcDeliveryThread.sourceKind)) {
+          if (this.shouldFallbackDesktopIpcNoClientToAppServer(desktopIpcError, desktopIpcDeliveryBaseline)) {
+            console.warn(
+              `[bridge] Codex Desktop IPC had no client for idle thread ${threadId}; starting via app-server instead.`
+            );
+            return await this.startTurnViaAppServer(
+              threadId,
+              effectiveText,
+              options,
+              "appServerStartAfterDesktopIpcNoClient"
+            );
+          }
           throw new Error(this.codexDesktopIpcDeliveryFailureMessage(threadId, desktopIpcError));
         }
         console.warn(
@@ -1765,17 +1544,11 @@ export class CodexAppServerClient extends EventEmitter {
 
     if (await this.shouldStartViaAppServer(threadId)) {
       try {
-        return await this.request("turn/start", {
-          threadId,
-          input: this.turnInput(effectiveText, options),
-        });
+        return await this.startTurnViaAppServer(threadId, effectiveText, options);
       } catch (error) {
         appServerStartError = error instanceof Error ? error : new Error(String(error));
         if (await this.tryResumeAppServerThreadForDelivery(threadId, appServerStartError)) {
-          return await this.request("turn/start", {
-            threadId,
-            input: this.turnInput(effectiveText, options),
-          });
+          return await this.startTurnViaAppServer(threadId, effectiveText, options);
         }
         if (
           (preferCLIResumeFallback || hasExactManagedLaunch)
@@ -1801,16 +1574,10 @@ export class CodexAppServerClient extends EventEmitter {
     }
 
     try {
-      return await this.request("turn/start", {
-        threadId,
-        input: this.turnInput(effectiveText, options),
-      });
+      return await this.startTurnViaAppServer(threadId, effectiveText, options);
     } catch (error) {
       if (await this.tryResumeAppServerThreadForDelivery(threadId, error)) {
-        return await this.request("turn/start", {
-          threadId,
-          input: this.turnInput(effectiveText, options),
-        });
+        return await this.startTurnViaAppServer(threadId, effectiveText, options);
       }
       if (await this.shouldResumeTurnViaCLI(threadId, error)) {
         return await this.startTurnViaCLIResume(threadId, effectiveText, options);
@@ -1847,6 +1614,40 @@ export class CodexAppServerClient extends EventEmitter {
     }
 
     return input;
+  }
+
+  private async startTurnViaAppServer(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions = {},
+    mode = "appServerStart"
+  ): Promise<JSONValue | undefined> {
+    const result = await this.request("turn/start", {
+      threadId,
+      input: this.turnInput(text, options),
+    });
+    if (!isRecord(result)) {
+      return result;
+    }
+    return {
+      ...result,
+      mode: stringValue(result.mode) ?? mode,
+      threadId: stringValue(result.threadId) ?? threadId,
+    };
+  }
+
+  private shouldFallbackDesktopIpcNoClientToAppServer(
+    error: Error,
+    baseline: ThreadDeliverySnapshot | null
+  ): boolean {
+    return this.isCodexDesktopIpcNoClientError(error) && baseline?.threadStatus !== "running";
+  }
+
+  private isCodexDesktopIpcNoClientError(error: Error): boolean {
+    if (error instanceof CodexDesktopIpcRequestError && error.code === "no-client-found") {
+      return true;
+    }
+    return error.message.toLowerCase().includes("no-client-found");
   }
 
   private async startTurnViaCodexDesktopIpc(

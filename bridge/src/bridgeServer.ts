@@ -1031,9 +1031,18 @@ export class BridgeServer {
               : undefined,
         });
         const threadId = this.threadIdFromStartThreadResult(result);
-        const detail = threadId
-          ? await this.readNormalizedThreadDetailCoalesced(threadId, null, { includeLiveRuntimeTail: true })
-          : null;
+        let detail = null;
+        if (threadId) {
+          try {
+            detail = await this.readNormalizedThreadDetailCoalesced(threadId, null, {
+              includeLiveRuntimeTail: true,
+            });
+          } catch (error) {
+            console.warn(
+              `[bridge] new thread ${threadId} detail is not ready after start: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        }
         this.invalidateThreadListCache();
         res.json({
           threadId,
