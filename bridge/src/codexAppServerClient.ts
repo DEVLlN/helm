@@ -67,6 +67,11 @@ type PendingRequest = {
   timeout: NodeJS.Timeout;
 };
 
+type BackgroundRequestSettlement = {
+  result?: JSONValue | undefined;
+  error?: Error;
+};
+
 const execFileAsync = promisify(execFile);
 const BOOTSTRAP_THREAD_TEXT =
   "Reply with exactly HELM_BOOTSTRAP_OK and do nothing else.";
@@ -91,6 +96,7 @@ const CODEX_DESKTOP_REFRESH_AFTER_TARGET_MS = 180;
 const CODEX_DESKTOP_REFRESH_RETRY_SETTLE_MS = 1_500;
 const CODEX_DESKTOP_IPC_LATE_DELIVERY_TIMEOUT_MS = 6_000;
 const DELIVERY_APP_SERVER_RESPONSE_TIMEOUT_MS = 15_000;
+const DELIVERY_APP_SERVER_BACKGROUND_TIMEOUT_MS = 90_000;
 
 type CodexAppServerSocket = WebSocket;
 
@@ -853,6 +859,57 @@ export class CodexAppServerClient extends EventEmitter {
     });
   }
 
+  private async sendRequestInBackground(
+    method: string,
+    params?: JSONValue,
+    timeoutMs = 30_000,
+    onSettle?: (settlement: BackgroundRequestSettlement) => void
+  ): Promise<JSONRPCId> {
+    await this.connect();
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Codex app-server socket is not connected");
+    }
+
+    const id = this.nextId++;
+    const request: JSONRPCRequest = {
+      id,
+      method,
+      params,
+    };
+    const settle = (settlement: BackgroundRequestSettlement) => {
+      if (!onSettle) {
+        return;
+      }
+      try {
+        onSettle(settlement);
+      } catch (error) {
+        console.warn(
+          `[bridge] Background Codex app-server settlement handler failed for ${method}: ${errorMessage(error)}`
+        );
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      if (this.pending.has(id)) {
+        this.pending.delete(id);
+        settle({ error: new Error(`Request timed out: ${method}`) });
+      }
+    }, timeoutMs);
+    this.pending.set(id, {
+      resolve: (result) => settle({ result }),
+      reject: (error) => settle({ error }),
+      timeout,
+    });
+    try {
+      this.socket.send(JSON.stringify(request));
+    } catch (error) {
+      this.pending.delete(id);
+      clearTimeout(timeout);
+      throw error;
+    }
+    return id;
+  }
+
   private rejectPendingRequests(error: Error): void {
     for (const [id, pending] of this.pending.entries()) {
       this.pending.delete(id);
@@ -1457,6 +1514,8 @@ export class CodexAppServerClient extends EventEmitter {
     const activeDeliveryThread = activeDeliveryRequested ? deliveryThread : null;
     const activeDeliveryUsesSharedDesktopSurface =
       activeDeliveryThread ? codexSourceKindUsesSharedDesktopSurface(activeDeliveryThread.sourceKind) : false;
+    const activeDeliveryRequiresDesktopIpc =
+      activeDeliveryThread ? codexSourceKindRequiresDesktopIpc(activeDeliveryThread.sourceKind) : false;
     const activeDeliverySnapshot = activeDeliveryRequested
       ? await this.readThreadDeliverySnapshot(threadId, activeDeliveryText)
       : null;
@@ -1475,6 +1534,23 @@ export class CodexAppServerClient extends EventEmitter {
       ? activeDeliverySnapshot
         ?? this.threadDeliverySnapshotFromSummary(desktopIpcDeliveryThread)
       : null;
+    if (
+      activeDeliveryRequested
+      && activeDeliveryRequiresDesktopIpc
+      && !hasImageAttachments
+    ) {
+      const appServerFirst = await this.startCodexDesktopMobileDeliveryViaAppServerFirst(
+        threadId,
+        activeDeliveryText,
+        options,
+        activeDeliveryNeedsRunningTurnSteer,
+        activeDeliverySnapshot
+      );
+      if (appServerFirst) {
+        return appServerFirst;
+      }
+    }
+
     if (
       desktopIpcDeliveryThread
       && codexSourceKindUsesSharedDesktopSurface(desktopIpcDeliveryThread.sourceKind)
@@ -1506,11 +1582,19 @@ export class CodexAppServerClient extends EventEmitter {
           );
         }
         if (steerDeliveryRequested) {
-          return await this.steerTurnViaCodexDesktopIpc(
+          if (activeDeliveryNeedsRunningTurnSteer) {
+            return await this.steerTurnViaCodexDesktopIpc(
+              threadId,
+              effectiveText,
+              options,
+              desktopIpcDeliveryThread,
+              desktopIpcDeliveryBaseline
+            );
+          }
+          return await this.startTurnViaCodexDesktopIpc(
             threadId,
-            effectiveText,
+            activeDeliveryText,
             options,
-            desktopIpcDeliveryThread,
             desktopIpcDeliveryBaseline
           );
         }
@@ -1857,6 +1941,30 @@ export class CodexAppServerClient extends EventEmitter {
     };
   }
 
+  private async startTurnViaAppServerAccepted(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions = {},
+    mode = "appServerStartAccepted"
+  ): Promise<JSONValue | undefined> {
+    const requestId = await this.sendRequestInBackground(
+      "turn/start",
+      {
+        threadId,
+        input: this.turnInput(text, options),
+      },
+      DELIVERY_APP_SERVER_BACKGROUND_TIMEOUT_MS,
+      (settlement) => this.logBackgroundTurnStartSettlement(threadId, mode, settlement)
+    );
+    return {
+      ok: true,
+      accepted: true,
+      mode,
+      threadId,
+      requestId,
+    };
+  }
+
   private async startTurnViaAppServerAfterEnsuringThreadLoaded(
     threadId: string,
     text: string,
@@ -1866,6 +1974,141 @@ export class CodexAppServerClient extends EventEmitter {
   ): Promise<JSONValue | undefined> {
     await this.ensureAppServerThreadLoadedForDelivery(threadId, { forceResume: true });
     return await this.startTurnViaAppServer(threadId, text, options, mode, responseTimeoutMs);
+  }
+
+  private async startTurnViaAppServerAfterEnsuringThreadLoadedAccepted(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions = {},
+    mode = "appServerStartAfterThreadLoadAccepted"
+  ): Promise<JSONValue | undefined> {
+    await this.ensureAppServerThreadLoadedForDelivery(threadId);
+    return await this.startTurnViaAppServerAccepted(threadId, text, options, mode);
+  }
+
+  private async startCodexDesktopMobileDeliveryViaAppServerFirst(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions,
+    needsSteer: boolean,
+    baseline: ThreadDeliverySnapshot | null
+  ): Promise<JSONValue | undefined> {
+    if (needsSteer && baseline?.activeTurnId) {
+      try {
+        const steered = await this.startTurnViaAppServerSteerAcceptedWithStartFallback(
+          threadId,
+          text,
+          options,
+          baseline,
+          "appServerSteerAcceptedForCodexDesktopMobileDelivery"
+        );
+        if (steered) {
+          return steered;
+        }
+      } catch (error) {
+        const steerError = error instanceof Error ? error : new Error(String(error));
+        if (!this.shouldQueueCodexDesktopFallbackAfterAppServerError(steerError)) {
+          console.warn(
+            `[bridge] Codex app-server-first steer failed for ${threadId}; falling back to Codex Desktop IPC: ${steerError.message}`
+          );
+          return undefined;
+        }
+      }
+    }
+
+    try {
+      return await this.startTurnViaAppServerAfterEnsuringThreadLoadedAccepted(
+        threadId,
+        text,
+        options,
+        needsSteer
+          ? "appServerStartAcceptedAfterAppServerFirstSteerUnavailable"
+          : "appServerStartAcceptedForCodexDesktopMobileDelivery"
+      );
+    } catch (error) {
+      console.warn(
+        `[bridge] Codex app-server-first start failed for ${threadId}; falling back to Codex Desktop IPC: ${errorMessage(error)}`
+      );
+      return undefined;
+    }
+  }
+
+  private async startTurnViaAppServerSteerAcceptedWithStartFallback(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions,
+    baseline: ThreadDeliverySnapshot,
+    mode: string
+  ): Promise<JSONValue | undefined> {
+    if (!baseline.activeTurnId) {
+      return undefined;
+    }
+
+    const requestId = await this.sendRequestInBackground(
+      "turn/steer",
+      {
+        threadId,
+        input: this.turnInput(text, {}),
+        expectedTurnId: baseline.activeTurnId,
+      },
+      DELIVERY_APP_SERVER_BACKGROUND_TIMEOUT_MS,
+      (settlement) => {
+        if (settlement.error) {
+          console.warn(
+            `[bridge] Background Codex app-server turn/steer failed after accepted mobile send thread=${threadId} mode=${mode}: ${settlement.error.message}`
+          );
+          if (this.shouldQueueCodexDesktopFallbackAfterAppServerError(settlement.error)) {
+            void this.startTurnViaAppServerAfterEnsuringThreadLoadedAccepted(
+              threadId,
+              text,
+              options,
+              "appServerStartAcceptedAfterBackgroundSteerUnavailable"
+            ).catch((startError) => {
+              console.warn(
+                `[bridge] Background Codex app-server start fallback failed after accepted steer thread=${threadId}: ${errorMessage(startError)}`
+              );
+            });
+          }
+          return;
+        }
+        const result = settlement.result;
+        const resultRecord = isRecord(result) ? result : {};
+        const turnId = stringValue(resultRecord.turnId) ?? "unknown";
+        console.log(
+          `[bridge] Background Codex app-server turn/steer settled thread=${threadId} mode=${mode} turn=${turnId}`
+        );
+      }
+    );
+
+    return {
+      ok: true,
+      accepted: true,
+      mode,
+      threadId,
+      requestId,
+    };
+  }
+
+  private logBackgroundTurnStartSettlement(
+    threadId: string,
+    mode: string,
+    settlement: BackgroundRequestSettlement
+  ): void {
+    if (settlement.error) {
+      console.warn(
+        `[bridge] Background Codex app-server turn/start failed after accepted mobile send thread=${threadId} mode=${mode}: ${settlement.error.message}`
+      );
+      return;
+    }
+
+    const result = settlement.result;
+    const resultRecord = isRecord(result) ? result : {};
+    const turnRecord = isRecord(resultRecord.turn) ? resultRecord.turn : {};
+    const turnId = stringValue(turnRecord.id) ?? stringValue(resultRecord.turnId) ?? "unknown";
+    const status = stringValue(turnRecord.status) ?? "unknown";
+    console.log(
+      `[bridge] Background Codex app-server turn/start settled thread=${threadId} mode=${mode} turn=${turnId} status=${status}`
+    );
   }
 
   private async ensureAppServerThreadLoadedForDelivery(

@@ -6,7 +6,7 @@ import { BridgeServer } from "./bridgeServer.js";
 
 async function main(): Promise<void> {
   const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const server = new BridgeServer();
+  const server = new BridgeServer({ rootDir });
   await server.start();
   startBridgeAutoUpdater({ rootDir, logger: console });
   console.log("[bridge] listening");

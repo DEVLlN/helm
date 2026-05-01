@@ -12,6 +12,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import type { AgentBackend } from "./agentBackend.js";
 import { CommandModeDriver } from "./commandModeDriver.js";
 import { config } from "./config.js";
+import { getBridgeUpdateStatus } from "./bridgeAutoUpdater.js";
 import { ClaudeCodeBackend } from "./claudeCodeBackend.js";
 import { CodexBackend } from "./codexBackend.js";
 import { createCodexAutomation, listCodexAutomations } from "./codexAutomations.js";
@@ -229,6 +230,7 @@ export class BridgeServer {
   private readonly voiceProviders = new Map<string, VoiceProvider>();
   private readonly defaultVoiceProviderId: string;
   private readonly commandModeDriver = new CommandModeDriver();
+  private readonly rootDir: string;
   private readonly mirroredThreadDetailCache = new Map<string, string>();
   private readonly mirroredThreadDetailObjectCache = new Map<string, ThreadDetail>();
   private mirroredThreadListCache: string | null = null;
@@ -246,7 +248,8 @@ export class BridgeServer {
   private readonly codexRolloutLiveMirror: CodexRolloutLiveMirrorController;
   private threadMirrorPollInFlight = false;
 
-  constructor() {
+  constructor(options: { rootDir?: string } = {}) {
+    this.rootDir = options.rootDir ?? process.cwd();
     const codex = new CodexBackend(config.codexAppServerUrl);
     this.backends.set(codex.summary.id, codex);
     for (const backend of this.futureBackends()) {
@@ -902,6 +905,18 @@ export class BridgeServer {
       res.json({
         pairing: this.describePairing(loopback),
       });
+    });
+
+    this.app.get("/api/update", async (_req, res) => {
+      try {
+        const update = await getBridgeUpdateStatus({
+          rootDir: this.rootDir,
+          logger: console,
+        });
+        res.json({ update });
+      } catch (error) {
+        this.handleError(res, error);
+      }
     });
 
     this.app.get("/api/threads", async (_req, res) => {

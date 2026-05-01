@@ -20,6 +20,8 @@ export interface BridgeUpdateCheckResult {
   currentVersion?: string;
   latestVersion?: string;
   installMethod?: BridgeInstallMethod;
+  updateURL?: string;
+  updateCommand?: string;
 }
 
 export interface BridgeUpdateCheckOptions {
@@ -32,6 +34,16 @@ export interface BridgeUpdateCheckOptions {
   runUpdate?: (command: string, args: string[]) => void;
   scriptExists?: (path: string) => boolean;
   logger?: Pick<Console, "log" | "warn">;
+}
+
+export interface BridgeUpdateStatus {
+  status: "disabled" | "current" | "available" | "skipped";
+  reason?: string;
+  currentVersion?: string;
+  latestVersion?: string;
+  installMethod?: BridgeInstallMethod;
+  updateURL?: string;
+  updateCommand?: string;
 }
 
 export interface StartBridgeAutoUpdaterOptions extends BridgeUpdateCheckOptions {
@@ -128,6 +140,28 @@ export function buildBridgeUpdateCommand(input: {
   };
 }
 
+function updateCommandForDisplay(installMethod: BridgeInstallMethod): string {
+  switch (installMethod) {
+    case "homebrew":
+      return "brew update && brew upgrade devlln/helm/helm";
+    case "npm":
+      return "npm install -g @devlln/helm@latest";
+    case "git":
+      return "git pull && npm --prefix bridge install";
+    case "unknown":
+    default:
+      return "helm update";
+  }
+}
+
+function updateURLForVersion(version: string | undefined): string | undefined {
+  if (!version) {
+    return undefined;
+  }
+
+  return `https://www.npmjs.com/package/${PUBLIC_PACKAGE_NAME}/v/${version}`;
+}
+
 function readPackageInfo(rootDir: string): BridgePackageInfo | null {
   try {
     const parsed = JSON.parse(readFileSync(join(rootDir, "package.json"), "utf8")) as {
@@ -169,6 +203,38 @@ function runDetachedUpdate(command: string, args: string[]): void {
 }
 
 export async function checkForBridgeUpdate(options: BridgeUpdateCheckOptions): Promise<BridgeUpdateCheckResult> {
+  const status = await getBridgeUpdateStatus(options);
+  switch (status.status) {
+    case "disabled":
+    case "current":
+    case "skipped":
+      return {
+        ...status,
+        status: status.status,
+      };
+    case "available":
+      break;
+  }
+
+  const installMethod = status.installMethod ?? "unknown";
+  const updateCommand = buildBridgeUpdateCommand({ rootDir: options.rootDir, installMethod });
+  const runUpdate = options.runUpdate ?? runDetachedUpdate;
+  runUpdate(updateCommand.command, updateCommand.args);
+  options.logger?.log(
+    `[bridge] Helm ${status.currentVersion ?? "<unknown>"} is older than ${status.latestVersion ?? "<unknown>"}; started ${installMethod} update.`
+  );
+
+  return {
+    status: "started",
+    currentVersion: status.currentVersion,
+    latestVersion: status.latestVersion,
+    installMethod,
+    updateURL: status.updateURL,
+    updateCommand: status.updateCommand,
+  };
+}
+
+export async function getBridgeUpdateStatus(options: BridgeUpdateCheckOptions): Promise<BridgeUpdateStatus> {
   const env = options.env ?? process.env;
   const packageInfo = options.packageInfo ?? readPackageInfo(options.rootDir);
   if (!packageInfo) {
@@ -188,6 +254,7 @@ export async function checkForBridgeUpdate(options: BridgeUpdateCheckOptions): P
       reason: "auto-update-disabled",
       currentVersion: packageInfo.version,
       installMethod,
+      updateCommand: updateCommandForDisplay(installMethod),
     };
   }
 
@@ -199,6 +266,7 @@ export async function checkForBridgeUpdate(options: BridgeUpdateCheckOptions): P
       reason: "update-script-missing",
       currentVersion: packageInfo.version,
       installMethod,
+      updateCommand: updateCommandForDisplay(installMethod),
     };
   }
 
@@ -213,6 +281,7 @@ export async function checkForBridgeUpdate(options: BridgeUpdateCheckOptions): P
       reason: "latest-version-fetch-failed",
       currentVersion: packageInfo.version,
       installMethod,
+      updateCommand: updateCommandForDisplay(installMethod),
     };
   }
 
@@ -222,6 +291,7 @@ export async function checkForBridgeUpdate(options: BridgeUpdateCheckOptions): P
       reason: "latest-version-unavailable",
       currentVersion: packageInfo.version,
       installMethod,
+      updateCommand: updateCommandForDisplay(installMethod),
     };
   }
 
@@ -231,18 +301,18 @@ export async function checkForBridgeUpdate(options: BridgeUpdateCheckOptions): P
       currentVersion: packageInfo.version,
       latestVersion,
       installMethod,
+      updateURL: updateURLForVersion(latestVersion),
+      updateCommand: updateCommandForDisplay(installMethod),
     };
   }
 
-  const runUpdate = options.runUpdate ?? runDetachedUpdate;
-  runUpdate(updateCommand.command, updateCommand.args);
-  options.logger?.log(`[bridge] Helm ${packageInfo.version} is older than ${latestVersion}; started ${installMethod} update.`);
-
   return {
-    status: "started",
+    status: "available",
     currentVersion: packageInfo.version,
     latestVersion,
     installMethod,
+    updateURL: updateURLForVersion(latestVersion),
+    updateCommand: updateCommandForDisplay(installMethod),
   };
 }
 

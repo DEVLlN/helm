@@ -6,6 +6,7 @@ import {
   checkForBridgeUpdate,
   compareSemver,
   detectBridgeInstallMethod,
+  getBridgeUpdateStatus,
   shouldEnableBridgeAutoUpdate,
 } from "./bridgeAutoUpdater.js";
 
@@ -100,4 +101,22 @@ test("checkForBridgeUpdate starts the updater when registry version is newer", a
       args: ["--yes", "--source", "bridge-auto", "--method", "npm"],
     },
   ]);
+});
+
+test("getBridgeUpdateStatus reports available updates with a user-facing link and command", async () => {
+  const result = await getBridgeUpdateStatus({
+    rootDir: "/opt/homebrew/Cellar/helm/0.2.0/libexec",
+    packageInfo: { name: "@devlln/helm", version: "0.2.0" },
+    hasGitDir: false,
+    env: {},
+    installMethod: "homebrew",
+    fetchLatestVersion: async () => "0.2.1",
+    scriptExists: () => true,
+  });
+
+  assert.equal(result.status, "available");
+  assert.equal(result.currentVersion, "0.2.0");
+  assert.equal(result.latestVersion, "0.2.1");
+  assert.equal(result.updateURL, "https://www.npmjs.com/package/@devlln/helm/v/0.2.1");
+  assert.equal(result.updateCommand, "brew update && brew upgrade devlln/helm/helm");
 });

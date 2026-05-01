@@ -81,6 +81,12 @@ type CodexClientPrivateHooks = {
     discovered: { name: string | null; preview?: string | null; updatedAt: number; status: string | null } | null
   ): { name: string | null; preview: string; status: string | null };
   request(method: string, params?: JSONValue): Promise<JSONValue | undefined>;
+  sendRequestInBackground(
+    method: string,
+    params?: JSONValue,
+    timeoutMs?: number,
+    onSettle?: (settlement: { result?: JSONValue; error?: Error }) => void
+  ): Promise<string | number>;
   readCodexDesktopActiveWorkspaceRoots(): Promise<string[]>;
   loadThreadDeliverySummary(threadId: string): Promise<{ sourceKind?: string | null; status?: string | null } | null>;
   readThreadDeliverySnapshot(threadId: string, text: string): Promise<{
@@ -137,6 +143,13 @@ type CodexClientPrivateHooks = {
       activeTurnId: string | null;
     },
     options?: { swallowErrors?: boolean }
+  ): Promise<JSONValue | undefined>;
+  startCodexDesktopMobileDeliveryViaAppServerFirst(
+    threadId: string,
+    text: string,
+    options: TestStartTurnOptions,
+    needsSteer: boolean,
+    baseline: unknown
   ): Promise<JSONValue | undefined>;
   ensureAppServerThreadLoadedForDelivery(
     threadId: string,
@@ -327,6 +340,8 @@ test("queued idle Codex desktop turn starts immediately instead of becoming an i
   const hooks = client as unknown as CodexClientPrivateHooks;
   let enqueueCalls = 0;
   let startCalls = 0;
+  const ensureCalls: Array<{ threadId: string; options?: { forceResume?: boolean } }> = [];
+  const backgroundRequestCalls: Array<{ method: string; params?: JSONValue; timeoutMs?: number }> = [];
 
   hooks.loadThreadDeliverySummary = async () => ({
     sourceKind: "vscode",
@@ -346,14 +361,14 @@ test("queued idle Codex desktop turn starts immediately instead of becoming an i
   };
   hooks.startTurnViaCodexDesktopIpc = async (threadId, text, options) => {
     startCalls += 1;
-    assert.equal(threadId, "thread-1");
-    assert.equal(text, "from mobile");
-    assert.equal(options.deliveryMode, "queue");
-    return {
-      ok: true,
-      mode: "codexDesktopIpcStart",
-      threadId,
-    };
+    throw new Error(`idle desktop sends should use app-server first: ${threadId} ${text} ${options.deliveryMode}`);
+  };
+  hooks.ensureAppServerThreadLoadedForDelivery = async (threadId, options) => {
+    ensureCalls.push({ threadId, options });
+  };
+  hooks.sendRequestInBackground = async (method: string, params?: JSONValue, timeoutMs?: number) => {
+    backgroundRequestCalls.push({ method, params, timeoutMs });
+    return 42;
   };
 
   const result = await client.startTurn("thread-1", "from mobile", {
@@ -361,11 +376,35 @@ test("queued idle Codex desktop turn starts immediately instead of becoming an i
   });
 
   assert.equal(enqueueCalls, 0);
-  assert.equal(startCalls, 1);
+  assert.equal(startCalls, 0);
+  assert.deepEqual(ensureCalls, [
+    {
+      threadId: "thread-1",
+      options: undefined,
+    },
+  ]);
+  assert.deepEqual(backgroundRequestCalls, [
+    {
+      method: "turn/start",
+      timeoutMs: 90_000,
+      params: {
+        threadId: "thread-1",
+        input: [
+          {
+            type: "text",
+            text: "from mobile",
+            text_elements: [],
+          },
+        ],
+      },
+    },
+  ]);
   assert.deepEqual(result, {
     ok: true,
-    mode: "codexDesktopIpcStart",
+    accepted: true,
+    mode: "appServerStartAcceptedForCodexDesktopMobileDelivery",
     threadId: "thread-1",
+    requestId: 42,
   });
 });
 
@@ -416,12 +455,14 @@ test("thread delivery wait matches user text when the baseline was summary-only"
   assert.equal(delivered, true);
 });
 
-test("idle Codex desktop steer retries as an app-server start when route-refresh IPC has no loaded client", async () => {
+test("idle Codex desktop steer uses app-server start before route-refresh IPC", async () => {
   const client = new CodexAppServerClient("ws://127.0.0.1:0");
   const hooks = client as unknown as CodexClientPrivateHooks;
-  const requestCalls: Array<{ method: string; params?: JSONValue }> = [];
+  const backgroundRequestCalls: Array<{ method: string; params?: JSONValue; timeoutMs?: number }> = [];
   const ensureCalls: Array<{ threadId: string; options?: { forceResume?: boolean } }> = [];
   const refreshCalls: Array<{ threadId: string; reason?: string }> = [];
+  let desktopStartCalls = 0;
+  let desktopSteerCalls = 0;
 
   hooks.loadThreadDeliverySummary = async () => ({
     sourceKind: "vscode",
@@ -437,10 +478,12 @@ test("idle Codex desktop steer retries as an app-server start when route-refresh
     activeTurnId: null,
   });
   hooks.startTurnViaCodexDesktopIpc = async () => {
-    throw new Error("Codex Desktop IPC thread-follower-start-turn failed: no-client-found");
+    desktopStartCalls += 1;
+    throw new Error("idle desktop sends should use app-server first");
   };
   hooks.steerTurnViaCodexDesktopIpc = async () => {
-    throw new Error("Codex Desktop IPC thread-follower-steer-turn failed: no-client-found");
+    desktopSteerCalls += 1;
+    throw new Error("idle desktop sends should use app-server first");
   };
   hooks.enqueueTurnViaCodexDesktopIpc = async () => {
     throw new Error("idle desktop sends should not queue a follow-up");
@@ -454,11 +497,9 @@ test("idle Codex desktop steer retries as an app-server start when route-refresh
     return true;
   };
   hooks.waitForThreadDelivery = async () => false;
-  hooks.request = async (method: string, params?: JSONValue) => {
-    requestCalls.push({ method, params });
-    return {
-      ok: true,
-    };
+  hooks.sendRequestInBackground = async (method: string, params?: JSONValue, timeoutMs?: number) => {
+    backgroundRequestCalls.push({ method, params, timeoutMs });
+    return 43;
   };
 
   const result = await client.startTurn("thread-1", "from mobile", {
@@ -467,18 +508,23 @@ test("idle Codex desktop steer retries as an app-server start when route-refresh
 
   assert.deepEqual(result, {
     ok: true,
-    mode: "appServerStartAfterDesktopIpcNoClientWithDesktopRefresh",
+    accepted: true,
+    mode: "appServerStartAcceptedForCodexDesktopMobileDelivery",
     threadId: "thread-1",
+    requestId: 43,
   });
+  assert.equal(desktopStartCalls, 0);
+  assert.equal(desktopSteerCalls, 0);
   assert.deepEqual(ensureCalls, [
     {
       threadId: "thread-1",
-      options: { forceResume: true },
+      options: undefined,
     },
   ]);
-  assert.deepEqual(requestCalls, [
+  assert.deepEqual(backgroundRequestCalls, [
     {
       method: "turn/start",
+      timeoutMs: 90_000,
       params: {
         threadId: "thread-1",
         input: [
@@ -491,10 +537,7 @@ test("idle Codex desktop steer retries as an app-server start when route-refresh
       },
     },
   ]);
-  assert.deepEqual(refreshCalls, [
-    { threadId: "thread-1", reason: "desktop-ipc-start-unavailable" },
-    { threadId: "thread-1", reason: "desktop-ipc-no-client" },
-  ]);
+  assert.deepEqual(refreshCalls, []);
 });
 
 test("idle Codex desktop steer preserves mobile send when app-server fallback fails", async () => {
@@ -516,6 +559,7 @@ test("idle Codex desktop steer preserves mobile send when app-server fallback fa
     threadStatus: "idle",
     activeTurnId: null,
   });
+  hooks.startCodexDesktopMobileDeliveryViaAppServerFirst = async () => undefined;
   hooks.startTurnViaCodexDesktopIpc = async () => {
     throw new Error("Codex Desktop IPC thread-follower-start-turn failed: no-client-found");
   };
@@ -570,6 +614,7 @@ test("idle Codex desktop turn accepts late materialization after route-refresh n
     threadStatus: "idle",
     activeTurnId: null,
   });
+  hooks.startCodexDesktopMobileDeliveryViaAppServerFirst = async () => undefined;
   hooks.startTurnViaCodexDesktopIpc = async () => {
     throw new Error("Codex Desktop IPC thread-follower-start-turn failed: no-client-found");
   };
@@ -631,6 +676,7 @@ test("idle Codex desktop turn waits for late route-refresh IPC materialization",
     threadStatus: "idle",
     activeTurnId: null,
   });
+  hooks.startCodexDesktopMobileDeliveryViaAppServerFirst = async () => undefined;
   hooks.startTurnViaCodexDesktopIpc = async () => {
     throw new Error("Codex Desktop IPC request timed out: thread-follower-start-turn");
   };
@@ -694,6 +740,7 @@ test("Codex desktop route refresh retry rejects an unmaterialized timed-out star
     threadStatus: "idle",
     activeTurnId: null,
   });
+  hooks.startCodexDesktopMobileDeliveryViaAppServerFirst = async () => undefined;
   hooks.startTurnViaCodexDesktopIpc = async () => {
     throw new Error("Codex Desktop IPC request timed out: thread-follower-start-turn");
   };
@@ -749,6 +796,7 @@ test("running Codex desktop route-refresh steer timeout falls back to app-server
     threadStatus: "running",
     activeTurnId: "turn-1",
   });
+  hooks.startCodexDesktopMobileDeliveryViaAppServerFirst = async () => undefined;
   hooks.startTurnViaCodexDesktopIpc = async () => {
     throw new Error("Codex Desktop IPC request timed out: thread-follower-start-turn");
   };
@@ -941,14 +989,12 @@ test("missing delivery summary still retries text start for unloaded app-server 
   });
 });
 
-test("running Codex desktop steer falls back to app-server steer when desktop IPC has no loaded client", async () => {
+test("running Codex desktop steer acknowledges after background app-server steer handoff", async () => {
   const client = new CodexAppServerClient("ws://127.0.0.1:0");
   const hooks = client as unknown as CodexClientPrivateHooks;
-  const appServerSteerCalls: Array<{
-    threadId: string;
-    text: string;
-    activeTurnId: string | null;
-  }> = [];
+  const backgroundRequestCalls: Array<{ method: string; params?: JSONValue; timeoutMs?: number }> = [];
+  let desktopSteerCalls = 0;
+  let desktopStartCalls = 0;
 
   hooks.loadThreadDeliverySummary = async () => ({
     sourceKind: "vscode",
@@ -963,26 +1009,20 @@ test("running Codex desktop steer falls back to app-server steer when desktop IP
     activeTurnId: "turn-1",
   });
   hooks.steerTurnViaCodexDesktopIpc = async () => {
+    desktopSteerCalls += 1;
     throw new Error("Codex Desktop IPC thread-follower-steer-turn failed: no-client-found");
   };
   hooks.startTurnViaCodexDesktopIpc = async () => {
+    desktopStartCalls += 1;
     throw new Error("running steer must not start a side turn");
   };
   hooks.waitForThreadDelivery = async () => false;
   hooks.enqueueTurnViaCodexDesktopIpc = async (threadId, text) => {
     throw new Error(`running desktop steer should not queue before app-server steer fallback: ${threadId} ${text}`);
   };
-  hooks.startTurnViaAppServerSteer = async (threadId, text, baseline) => {
-    appServerSteerCalls.push({
-      threadId,
-      text,
-      activeTurnId: baseline.activeTurnId,
-    });
-    return {
-      ok: true,
-      mode: "appServerSteerQueued",
-      threadId,
-    };
+  hooks.sendRequestInBackground = async (method: string, params?: JSONValue, timeoutMs?: number) => {
+    backgroundRequestCalls.push({ method, params, timeoutMs });
+    return 44;
   };
 
   const result = await client.startTurn("thread-1", "testing mobile", {
@@ -991,14 +1031,28 @@ test("running Codex desktop steer falls back to app-server steer when desktop IP
 
   assert.deepEqual(result, {
     ok: true,
-    mode: "appServerSteerQueued",
+    accepted: true,
+    mode: "appServerSteerAcceptedForCodexDesktopMobileDelivery",
     threadId: "thread-1",
+    requestId: 44,
   });
-  assert.deepEqual(appServerSteerCalls, [
+  assert.equal(desktopSteerCalls, 0);
+  assert.equal(desktopStartCalls, 0);
+  assert.deepEqual(backgroundRequestCalls, [
     {
-      threadId: "thread-1",
-      text: "testing mobile",
-      activeTurnId: "turn-1",
+      method: "turn/steer",
+      timeoutMs: 90_000,
+      params: {
+        threadId: "thread-1",
+        input: [
+          {
+            type: "text",
+            text: "testing mobile",
+            text_elements: [],
+          },
+        ],
+        expectedTurnId: "turn-1",
+      },
     },
   ]);
 });
