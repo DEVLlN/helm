@@ -87,9 +87,10 @@ const CODEX_DESKTOP_CONTROLLER_NAME = "Codex Desktop";
 const CODEX_DESKTOP_DUPLICATE_QUEUE_WINDOW_MS = 2_500;
 const CODEX_DESKTOP_REFRESH_BUNDLE_ID = "com.openai.codex";
 const CODEX_DESKTOP_REFRESH_APP_PATH = "/Applications/Codex.app";
-const CODEX_DESKTOP_REFRESH_BOUNCE_URL = "codex://settings";
-const CODEX_DESKTOP_REFRESH_AFTER_BOUNCE_MS = 180;
 const CODEX_DESKTOP_REFRESH_AFTER_TARGET_MS = 180;
+const CODEX_DESKTOP_REFRESH_RETRY_SETTLE_MS = 1_500;
+const CODEX_DESKTOP_IPC_LATE_DELIVERY_TIMEOUT_MS = 6_000;
+const DELIVERY_APP_SERVER_RESPONSE_TIMEOUT_MS = 15_000;
 
 type CodexAppServerSocket = WebSocket;
 
@@ -813,12 +814,20 @@ export class CodexAppServerClient extends EventEmitter {
     }
   }
 
-  private async request(method: string, params?: JSONValue): Promise<JSONValue | undefined> {
+  private async request(
+    method: string,
+    params?: JSONValue,
+    timeoutMs?: number
+  ): Promise<JSONValue | undefined> {
     await this.connect();
-    return await this.sendRequest(method, params);
+    return await this.sendRequest(method, params, timeoutMs);
   }
 
-  private async sendRequest(method: string, params?: JSONValue): Promise<JSONValue | undefined> {
+  private async sendRequest(
+    method: string,
+    params?: JSONValue,
+    timeoutMs = 30_000
+  ): Promise<JSONValue | undefined> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("Codex app-server socket is not connected");
     }
@@ -839,7 +848,7 @@ export class CodexAppServerClient extends EventEmitter {
           this.pending.delete(id);
           reject(new Error(`Request timed out: ${method}`));
         }
-      }, 30_000);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timeout });
     });
   }
@@ -1464,7 +1473,6 @@ export class CodexAppServerClient extends EventEmitter {
     const desktopIpcDeliveryBaseline = desktopIpcDeliveryThread
       && codexSourceKindUsesSharedDesktopSurface(desktopIpcDeliveryThread.sourceKind)
       ? activeDeliverySnapshot
-        ?? await this.readThreadDeliverySnapshot(threadId, activeDeliveryText)
         ?? this.threadDeliverySnapshotFromSummary(desktopIpcDeliveryThread)
       : null;
     if (
@@ -1473,7 +1481,16 @@ export class CodexAppServerClient extends EventEmitter {
     ) {
       try {
         if (queueDeliveryRequested) {
-          if (!hasImageAttachments && desktopIpcDeliveryBaseline?.threadStatus !== "running") {
+          if (desktopIpcDeliveryBaseline?.threadStatus === "running" || Boolean(desktopIpcDeliveryBaseline?.activeTurnId)) {
+            return await this.steerTurnViaCodexDesktopIpc(
+              threadId,
+              queueSafeText,
+              options,
+              desktopIpcDeliveryThread,
+              desktopIpcDeliveryBaseline
+            );
+          }
+          if (!hasImageAttachments) {
             return await this.startTurnViaCodexDesktopIpc(
               threadId,
               activeDeliveryText,
@@ -1481,11 +1498,11 @@ export class CodexAppServerClient extends EventEmitter {
               desktopIpcDeliveryBaseline
             );
           }
-          return await this.enqueueTurnViaCodexDesktopIpc(
+          return await this.startTurnViaCodexDesktopIpc(
             threadId,
-            queueSafeText,
+            activeDeliveryText,
             options,
-            desktopIpcDeliveryThread
+            desktopIpcDeliveryBaseline
           );
         }
         if (steerDeliveryRequested) {
@@ -1531,6 +1548,25 @@ export class CodexAppServerClient extends EventEmitter {
             }
           }
           if (
+            steerDeliveryRequested
+            && desktopIpcDeliveryBaseline?.threadStatus === "running"
+            && this.isCodexDesktopIpcUnavailableForIdleDelivery(desktopIpcError)
+          ) {
+            const retried = await this.retryCodexDesktopIpcAfterRouteRefresh(
+              threadId,
+              activeDeliveryText,
+              options,
+              desktopIpcDeliveryThread,
+              desktopIpcDeliveryBaseline,
+              "steer",
+              desktopIpcError
+            );
+            if (retried) {
+              return retried;
+            }
+            throw new Error(this.codexDesktopIpcDeliveryFailureMessage(threadId, desktopIpcError));
+          }
+          if (
             this.shouldFallbackDesktopIpcNoClientToAppServer(
               desktopIpcError,
               desktopIpcDeliveryBaseline,
@@ -1538,9 +1574,28 @@ export class CodexAppServerClient extends EventEmitter {
             )
           ) {
             const needsDesktopRouteRefresh = codexSourceKindRequiresDesktopIpc(desktopIpcDeliveryThread.sourceKind);
+            if (needsDesktopRouteRefresh) {
+              const retryOperation = (
+                activeDeliveryNeedsRunningTurnSteer
+                || desktopIpcDeliveryBaseline?.threadStatus === "running"
+                || Boolean(desktopIpcDeliveryBaseline?.activeTurnId)
+              ) ? "steer" : "start";
+              const retried = await this.retryCodexDesktopIpcAfterRouteRefresh(
+                threadId,
+                activeDeliveryText,
+                options,
+                desktopIpcDeliveryThread,
+                desktopIpcDeliveryBaseline,
+                retryOperation,
+                desktopIpcError
+              );
+              if (retried) {
+                return retried;
+              }
+            }
             console.warn(
               needsDesktopRouteRefresh
-                ? `[bridge] Codex Desktop IPC had no client for idle desktop thread ${threadId}; loading it through app-server and refreshing Codex.app.`
+                ? `[bridge] Codex Desktop IPC had no client for idle desktop thread ${threadId}; trying app-server delivery after Codex.app route refresh retry failed.`
                 : `[bridge] Codex Desktop IPC had no client for idle thread ${threadId}; loading the thread and starting via app-server instead.`
             );
             if (needsDesktopRouteRefresh) {
@@ -1548,19 +1603,64 @@ export class CodexAppServerClient extends EventEmitter {
             }
             let result: JSONValue | undefined;
             try {
-              result = await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
-                threadId,
-                activeDeliveryText,
-                options,
-                needsDesktopRouteRefresh
-                  ? "appServerStartAfterDesktopIpcNoClientWithDesktopRefresh"
-                  : "appServerStartAfterDesktopIpcNoClient"
-              );
+              result = needsDesktopRouteRefresh
+                ? await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
+                    threadId,
+                    activeDeliveryText,
+                    options,
+                    "appServerStartAfterDesktopIpcNoClientWithDesktopRefresh",
+                    DELIVERY_APP_SERVER_RESPONSE_TIMEOUT_MS
+                  )
+                : await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
+                    threadId,
+                    activeDeliveryText,
+                    options,
+                    "appServerStartAfterDesktopIpcNoClient"
+                  );
             } catch (error) {
+              const appServerDeliveryError = error instanceof Error ? error : new Error(String(error));
+              if (
+                needsDesktopRouteRefresh
+                && this.shouldQueueCodexDesktopFallbackAfterAppServerError(appServerDeliveryError)
+              ) {
+                this.codexDesktopAppServerRefreshThreads.delete(threadId);
+                if (activeDeliveryRequested) {
+                  console.warn(
+                    `[bridge] Codex.app app-server fallback failed for ${threadId}; preserving the mobile send as a Codex queued follow-up: ${appServerDeliveryError.message}`
+                  );
+                  return await this.enqueueCodexDesktopFallbackAfterRouteRefreshFailure(
+                    threadId,
+                    activeDeliveryText,
+                    options,
+                    desktopIpcDeliveryThread
+                  );
+                }
+                throw new Error(
+                  `Codex.app delivery failed for ${threadId}: current Codex.app did not accept desktop IPC after route refresh, and app-server fallback failed: ${appServerDeliveryError.message}`
+                );
+              } else {
+                if (needsDesktopRouteRefresh) {
+                  this.codexDesktopAppServerRefreshThreads.delete(threadId);
+                }
+                throw appServerDeliveryError;
+              }
+            }
+            if (result === undefined) {
               if (needsDesktopRouteRefresh) {
                 this.codexDesktopAppServerRefreshThreads.delete(threadId);
               }
-              throw error;
+              if (needsDesktopRouteRefresh && activeDeliveryRequested) {
+                console.warn(
+                  `[bridge] Codex.app app-server fallback returned an empty result for ${threadId}; preserving the mobile send as a Codex queued follow-up.`
+                );
+                return await this.enqueueCodexDesktopFallbackAfterRouteRefreshFailure(
+                  threadId,
+                  activeDeliveryText,
+                  options,
+                  desktopIpcDeliveryThread
+                );
+              }
+              throw new Error(`Codex.app delivery failed for ${threadId}: empty app-server delivery result`);
             }
             if (needsDesktopRouteRefresh) {
               void this.refreshCodexDesktopThreadRoute(threadId, "desktop-ipc-no-client");
@@ -1740,12 +1840,13 @@ export class CodexAppServerClient extends EventEmitter {
     threadId: string,
     text: string,
     options: StartTurnOptions = {},
-    mode = "appServerStart"
+    mode = "appServerStart",
+    responseTimeoutMs?: number
   ): Promise<JSONValue | undefined> {
     const result = await this.request("turn/start", {
       threadId,
       input: this.turnInput(text, options),
-    });
+    }, responseTimeoutMs);
     if (!isRecord(result)) {
       return result;
     }
@@ -1760,10 +1861,11 @@ export class CodexAppServerClient extends EventEmitter {
     threadId: string,
     text: string,
     options: StartTurnOptions = {},
-    mode = "appServerStartAfterThreadLoad"
+    mode = "appServerStartAfterThreadLoad",
+    responseTimeoutMs?: number
   ): Promise<JSONValue | undefined> {
     await this.ensureAppServerThreadLoadedForDelivery(threadId, { forceResume: true });
-    return await this.startTurnViaAppServer(threadId, text, options, mode);
+    return await this.startTurnViaAppServer(threadId, text, options, mode, responseTimeoutMs);
   }
 
   private async ensureAppServerThreadLoadedForDelivery(
@@ -1819,7 +1921,7 @@ export class CodexAppServerClient extends EventEmitter {
     baseline: ThreadDeliverySnapshot | null,
     sourceKind: string | null | undefined
   ): boolean {
-    if (!this.isCodexDesktopIpcNoClientError(error) || baseline?.threadStatus === "running") {
+    if (!this.isCodexDesktopIpcUnavailableForIdleDelivery(error) || baseline?.threadStatus === "running") {
       return false;
     }
 
@@ -1837,11 +1939,36 @@ export class CodexAppServerClient extends EventEmitter {
       || message.includes("is not materialized yet");
   }
 
+  private isAppServerDeliveryResponseTimeout(error: Error): boolean {
+    const normalized = error.message.toLowerCase();
+    return normalized.includes("request timed out: turn/start");
+  }
+
+  private shouldQueueCodexDesktopFallbackAfterAppServerError(error: Error): boolean {
+    const normalized = error.message.toLowerCase();
+    return this.isAppServerDeliveryResponseTimeout(error)
+      || this.shouldRetryAppServerStartAfterThreadLoadError(error)
+      || normalized.includes("no active turn to steer");
+  }
+
   private isCodexDesktopIpcNoClientError(error: Error): boolean {
     if (error instanceof CodexDesktopIpcRequestError && error.code === "no-client-found") {
       return true;
     }
     return error.message.toLowerCase().includes("no-client-found");
+  }
+
+  private isCodexDesktopIpcUnavailableForIdleDelivery(error: Error): boolean {
+    if (this.isCodexDesktopIpcNoClientError(error)) {
+      return true;
+    }
+
+    return this.isCodexDesktopIpcRequestTimeoutError(error);
+  }
+
+  private isCodexDesktopIpcRequestTimeoutError(error: Error): boolean {
+    const normalized = error.message.toLowerCase();
+    return normalized.includes("codex desktop ipc request timed out");
   }
 
   private canRefreshCodexDesktopThreadRoute(): boolean {
@@ -1876,8 +2003,6 @@ export class CodexAppServerClient extends EventEmitter {
 
     const targetUrl = `codex://threads/${encodeURIComponent(threadId)}`;
     try {
-      await this.openCodexDesktopUrl(CODEX_DESKTOP_REFRESH_BOUNCE_URL);
-      await sleep(CODEX_DESKTOP_REFRESH_AFTER_BOUNCE_MS);
       await this.openCodexDesktopUrl(targetUrl);
       await sleep(CODEX_DESKTOP_REFRESH_AFTER_TARGET_MS);
       console.log(`[bridge] Refreshed Codex.app thread route ${threadId} after ${reason}`);
@@ -1888,6 +2013,181 @@ export class CodexAppServerClient extends EventEmitter {
       );
       return false;
     }
+  }
+
+  private async retryCodexDesktopIpcAfterRouteRefresh(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions,
+    thread: ThreadSummary,
+    baseline: ThreadDeliverySnapshot | null,
+    operation: "start" | "steer",
+    originalError: Error
+  ): Promise<JSONValue | undefined> {
+    if (!this.isCodexDesktopIpcUnavailableForIdleDelivery(originalError)) {
+      return undefined;
+    }
+
+    const refreshed = await this.refreshCodexDesktopThreadRoute(threadId, `desktop-ipc-${operation}-unavailable`);
+    if (!refreshed) {
+      return undefined;
+    }
+
+    await sleep(CODEX_DESKTOP_REFRESH_RETRY_SETTLE_MS);
+
+    try {
+      if (operation === "steer") {
+        return await this.steerTurnViaCodexDesktopIpc(threadId, text, options, thread, baseline);
+      }
+      return await this.startTurnViaCodexDesktopIpc(threadId, text, options, baseline);
+    } catch (error) {
+      const retryError = error instanceof Error ? error : new Error(String(error));
+      if (this.isCodexDesktopIpcRequestTimeoutError(retryError)) {
+        console.warn(
+          `[bridge] Codex Desktop IPC ${operation} retry after route refresh timed out for ${threadId}; waiting for a late Codex.app thread update before trying any fallback.`
+        );
+        const delivered = baseline
+          ? await this.waitForThreadDelivery(
+              threadId,
+              text,
+              baseline,
+              CODEX_DESKTOP_IPC_LATE_DELIVERY_TIMEOUT_MS
+            )
+          : false;
+        if (delivered) {
+          return this.codexDesktopIpcResult(
+            { ok: true },
+            operation === "steer"
+              ? "codexDesktopIpcSteerAfterRouteRefreshLateConfirmation"
+              : "codexDesktopIpcStartAfterRouteRefreshLateConfirmation",
+            threadId
+          );
+        }
+        if (operation === "steer") {
+          const appServerSteer = await this.tryAppServerSteerAfterRouteRefreshFailure(
+            threadId,
+            text,
+            baseline,
+            options
+          );
+          if (appServerSteer) {
+            return appServerSteer;
+          }
+          console.warn(
+            `[bridge] Codex Desktop IPC steer retry after route refresh did not materialize for ${threadId}; preserving the mobile send as a Codex queued follow-up.`
+          );
+          return await this.enqueueCodexDesktopFallbackAfterRouteRefreshFailure(
+            threadId,
+            text,
+            options,
+            thread
+          );
+        }
+        throw new Error(
+          `Codex Desktop IPC ${operation} retry after route refresh timed out and no matching thread update was observed.`
+        );
+      }
+      if (this.isCodexDesktopIpcNoClientError(retryError)) {
+        console.warn(
+          `[bridge] Codex Desktop IPC ${operation} retry after route refresh reported no client for ${threadId}; checking for a late Codex.app thread update before trying any fallback.`
+        );
+        const delivered = baseline
+          ? await this.waitForThreadDelivery(
+              threadId,
+              text,
+              baseline,
+              CODEX_DESKTOP_IPC_LATE_DELIVERY_TIMEOUT_MS
+            )
+          : false;
+        if (delivered) {
+          return this.codexDesktopIpcResult(
+            { ok: true },
+            operation === "steer"
+              ? "codexDesktopIpcSteerAfterRouteRefreshLateConfirmation"
+              : "codexDesktopIpcStartAfterRouteRefreshLateConfirmation",
+            threadId
+          );
+        }
+        if (operation === "steer") {
+          const appServerSteer = await this.tryAppServerSteerAfterRouteRefreshFailure(
+            threadId,
+            text,
+            baseline,
+            options
+          );
+          if (appServerSteer) {
+            return appServerSteer;
+          }
+          console.warn(
+            `[bridge] Codex Desktop IPC steer retry after route refresh still had no client for ${threadId}; preserving the mobile send as a Codex queued follow-up.`
+          );
+          return await this.enqueueCodexDesktopFallbackAfterRouteRefreshFailure(
+            threadId,
+            text,
+            options,
+            thread
+          );
+        }
+      }
+      console.warn(
+        `[bridge] Codex Desktop IPC ${operation} retry after route refresh failed for ${threadId}: ${retryError.message}`
+      );
+      return undefined;
+    }
+  }
+
+  private async tryAppServerSteerAfterRouteRefreshFailure(
+    threadId: string,
+    text: string,
+    baseline: ThreadDeliverySnapshot | null,
+    options: StartTurnOptions
+  ): Promise<JSONValue | undefined> {
+    if (!baseline?.activeTurnId) {
+      return undefined;
+    }
+
+    try {
+      return await this.startTurnViaAppServerSteer(threadId, text, baseline, {
+        swallowErrors: false,
+      });
+    } catch (error) {
+      const steerError = error instanceof Error ? error : new Error(String(error));
+      if (this.shouldQueueCodexDesktopFallbackAfterAppServerError(steerError)) {
+        try {
+          return await this.startTurnViaAppServerAfterEnsuringThreadLoaded(
+            threadId,
+            text,
+            options,
+            "appServerStartAfterRouteRefreshSteerInactive",
+            DELIVERY_APP_SERVER_RESPONSE_TIMEOUT_MS
+          );
+        } catch (startError) {
+          console.warn(
+            `[bridge] Codex app-server start fallback after failed steer failed for ${threadId}: ${errorMessage(startError)}`
+          );
+        }
+      }
+
+      console.warn(
+        `[bridge] Codex app-server steer fallback after route refresh failed for ${threadId}: ${steerError.message}`
+      );
+      return undefined;
+    }
+  }
+
+  private async enqueueCodexDesktopFallbackAfterRouteRefreshFailure(
+    threadId: string,
+    text: string,
+    options: StartTurnOptions,
+    thread: ThreadSummary
+  ): Promise<JSONValue> {
+    const result = await this.enqueueTurnViaCodexDesktopIpc(threadId, text, options, thread);
+    return {
+      ...(isRecord(result) ? result : {}),
+      ok: true,
+      mode: "codexDesktopQueuedFollowUpAfterRouteRefreshFailure",
+      threadId,
+    } as JSONValue;
   }
 
   private async openCodexDesktopUrl(url: string): Promise<void> {
@@ -1992,7 +2292,13 @@ export class CodexAppServerClient extends EventEmitter {
       await this.writeCodexDesktopQueuedFollowUpsState(state);
       const client = new CodexDesktopIpcClient();
       try {
-        await client.broadcastQueuedFollowUpsChanged(threadId, state[threadId] ?? []);
+        try {
+          await client.broadcastQueuedFollowUpsChanged(threadId, state[threadId] ?? []);
+        } catch (error) {
+          console.warn(
+            `[bridge] Failed to broadcast Codex queued follow-up change for ${threadId}; Codex.app will pick it up from global state: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
         return this.codexDesktopIpcResult(
           { ok: true },
           "codexDesktopIpcQueuedFollowUpBroadcast",
@@ -2202,7 +2508,7 @@ export class CodexAppServerClient extends EventEmitter {
     options: StartTurnOptions
   ): CodexDesktopQueuedFollowUp {
     const prompt = this.codexDesktopQueuedFollowUpPrompt(text, options);
-    const cwd = thread.cwd.trim() || null;
+    const cwd = thread.cwd?.trim() || null;
     const workspaceRoot = cwd ?? "/";
     return {
       id: randomUUID(),
@@ -2529,6 +2835,9 @@ export class CodexAppServerClient extends EventEmitter {
 
   private async loadThreadDeliverySummary(threadId: string): Promise<ThreadSummary | null> {
     const discovered = await discoverCodexThread(threadId);
+    if (discovered && codexSourceKindUsesSharedDesktopSurface(discovered.sourceKind)) {
+      return discovered;
+    }
 
     try {
       const listed = (await this.listThreadsFromAppServer()).find((thread) => thread.id === threadId) ?? null;
@@ -2695,9 +3004,6 @@ export class CodexAppServerClient extends EventEmitter {
 
     const thread = await discoverCodexThread(threadId);
     if (!thread || !codexSourceKindUsesSharedDesktopSurface(thread.sourceKind)) {
-      return false;
-    }
-    if (codexSourceKindRequiresDesktopIpc(thread.sourceKind)) {
       return false;
     }
 
@@ -3155,11 +3461,12 @@ export class CodexAppServerClient extends EventEmitter {
         && (
           (
             snapshot.hasTurnData
+            && snapshot.matchingUserTextCount > baseline.matchingUserTextCount
+          )
+          || (
+            snapshot.hasTurnData
             && baseline.hasTurnData
-            && (
-              snapshot.turnCount > baseline.turnCount
-              || snapshot.matchingUserTextCount > baseline.matchingUserTextCount
-            )
+            && snapshot.turnCount > baseline.turnCount
           )
           || (
             snapshot.updatedAt > baseline.updatedAt

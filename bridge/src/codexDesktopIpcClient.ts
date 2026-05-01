@@ -8,6 +8,8 @@ import type { JSONValue } from "./types.js";
 
 const INITIALIZING_CLIENT_ID = "initializing-client";
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const INITIALIZE_REQUEST_TIMEOUT_MS = 1_500;
+const FOLLOWER_DELIVERY_REQUEST_TIMEOUT_MS = 12_000;
 const CONNECT_TIMEOUT_MS = 3_000;
 const MAX_IPC_FRAME_BYTES = 256 * 1024 * 1024;
 
@@ -129,7 +131,7 @@ export class CodexDesktopIpcClient {
         input: input as unknown as JSONValue,
         attachments: [],
       },
-    });
+    }, FOLLOWER_DELIVERY_REQUEST_TIMEOUT_MS);
   }
 
   async steerTurn(
@@ -143,7 +145,7 @@ export class CodexDesktopIpcClient {
       input: input as unknown as JSONValue,
       attachments,
       restoreMessage: restoreMessage as unknown as JSONValue,
-    });
+    }, FOLLOWER_DELIVERY_REQUEST_TIMEOUT_MS);
   }
 
   async setQueuedFollowUpsState(
@@ -169,7 +171,7 @@ export class CodexDesktopIpcClient {
   async interruptTurn(threadId: string): Promise<JSONValue | undefined> {
     return await this.request("thread-follower-interrupt-turn", {
       conversationId: threadId,
-    });
+    }, FOLLOWER_DELIVERY_REQUEST_TIMEOUT_MS);
   }
 
   async setModelAndReasoning(
@@ -255,7 +257,7 @@ export class CodexDesktopIpcClient {
 
     const initialized = await this.sendRequest("initialize", {
       clientType: "helm-bridge",
-    });
+    }, INITIALIZE_REQUEST_TIMEOUT_MS);
     if (initialized.resultType !== "success" || !isRecord(initialized.result)) {
       throw new Error(initialized.error ?? "Codex Desktop IPC initialize failed");
     }
@@ -267,9 +269,13 @@ export class CodexDesktopIpcClient {
     this.clientId = initializedClientId;
   }
 
-  private async request(method: string, params: JSONValue): Promise<JSONValue | undefined> {
+  private async request(
+    method: string,
+    params: JSONValue,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
+  ): Promise<JSONValue | undefined> {
     await this.connect();
-    const response = await this.sendRequest(method, params);
+    const response = await this.sendRequest(method, params, timeoutMs);
     if (response.resultType === "error") {
       throw new CodexDesktopIpcRequestError(method, response.error ?? "unknown-error");
     }

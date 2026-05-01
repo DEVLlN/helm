@@ -1,6 +1,6 @@
 {
   "name": "@devlln/helm",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "description": "Helm CLI bridge installer and runtime helpers.",
   "homepage": "https://github.com/DEVLlN/helm#readme",
